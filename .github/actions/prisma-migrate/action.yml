@@ -1,13 +1,17 @@
 name: 'Prisma Migrate Deploy'
-description: 'Run prisma migrate deploy across one or many databases with concurrency control and secret masking'
+description: >-
+  Run prisma migrate deploy across one or many databases with concurrency
+  control and secret masking
 author: 'weprograpp'
 
 inputs:
   database-url:
-    description: 'Single database URL or JSON array of database URLs'
+    description: >-
+      Single database URL or JSON array of database URLs
     required: true
   schema-path:
-    description: 'Path to Prisma schema file (default: prisma/schema.prisma)'
+    description: >-
+      Path to Prisma schema file (default: prisma/schema.prisma)
     required: false
     default: 'prisma/schema.prisma'
   prisma-version:
@@ -15,7 +19,8 @@ inputs:
     required: false
     default: 'latest'
   dry-run:
-    description: 'Run in dry-run mode (preview changes without applying)'
+    description: >-
+      Run in dry-run mode (preview changes without applying)
     required: false
     default: 'false'
   working-directory:
@@ -38,13 +43,13 @@ runs:
       shell: bash
       run: |
         echo "::group::Validating inputs"
-        
+
         # Validate schema path exists
         if [ ! -f "${{ inputs.working-directory }}/${{ inputs.schema-path }}" ]; then
           echo "::error::Schema file not found at ${{ inputs.working-directory }}/${{ inputs.schema-path }}"
           exit 1
         fi
-        
+
         # Validate database URLs
         DB_INPUT='${{ inputs.database-url }}'
         if [[ "$DB_INPUT" =~ ^\[.*\]$ ]]; then
@@ -54,7 +59,7 @@ runs:
           echo "Single database URL detected"
           echo "db-type=single" >> $GITHUB_ENV
         fi
-        
+
         echo "::endgroup::"
 
     - name: Setup Node.js
@@ -67,13 +72,13 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         echo "::group::Installing Prisma CLI"
-        
+
         if [ "${{ inputs.prisma-version }}" = "latest" ]; then
           npm install -g prisma
         else
           npm install -g prisma@${{ inputs.prisma-version }}
         fi
-        
+
         echo "Prisma version: $(prisma --version)"
         echo "::endgroup::"
 
@@ -83,29 +88,29 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         echo "::group::Parsing database URLs and running migrations"
-        
+
         # Initialize counters
         SUCCESS_COUNT=0
         TOTAL_COUNT=0
         MIGRATION_RESULTS=""
-        
+
         # Function to run migration for a single database
         run_migration() {
           local db_url="$1"
           local db_index="$2"
-          
+
           # Mask the database URL for security
           echo "::add-mask::$db_url"
-          
+
           echo "::group::Database $db_index migration"
           echo "Running migration for database $db_index..."
-          
+
           # Set DATABASE_URL for this migration
           export DATABASE_URL="$db_url"
-          
+
           # Build prisma command
           PRISMA_CMD="prisma migrate deploy --schema=${{ inputs.schema-path }}"
-          
+
           if [ "${{ inputs.dry-run }}" = "true" ]; then
             echo "🔍 DRY RUN MODE: Preview changes only"
             # For dry run, we'll use prisma migrate diff or status
@@ -128,36 +133,36 @@ runs:
               MIGRATION_RESULTS="${MIGRATION_RESULTS}Database $db_index: ❌ Migration failed\n"
             fi
           fi
-          
+
           echo "::endgroup::"
         }
-        
+
         # Parse database URLs
         DB_INPUT='${{ inputs.database-url }}'
-        
+
         if [ "${{ env.db-type }}" = "multiple" ]; then
           # Parse JSON array
           echo "Processing multiple database URLs..."
-          
+
           # Use jq to parse JSON array
           echo "$DB_INPUT" | jq -r '.[]' | while IFS= read -r db_url; do
             ((TOTAL_COUNT++))
             run_migration "$db_url" "$TOTAL_COUNT"
           done
-          
+
           # Since we're in a subshell, we need to recalculate
           SUCCESS_COUNT=0
           TOTAL_COUNT=0
           MIGRATION_RESULTS=""
-          
+
           while IFS= read -r db_url; do
             ((TOTAL_COUNT++))
-            
+
             # Mask the database URL
             echo "::add-mask::$db_url"
-            
+
             export DATABASE_URL="$db_url"
-            
+
             if [ "${{ inputs.dry-run }}" = "true" ]; then
               if prisma migrate status --schema=${{ inputs.schema-path }} >/dev/null 2>&1; then
                 ((SUCCESS_COUNT++))
@@ -174,17 +179,17 @@ runs:
               fi
             fi
           done < <(echo "$DB_INPUT" | jq -r '.[]')
-          
+
         else
           # Single database URL
           echo "Processing single database URL..."
           TOTAL_COUNT=1
-          
+
           # Mask the database URL
           echo "::add-mask::$DB_INPUT"
-          
+
           export DATABASE_URL="$DB_INPUT"
-          
+
           if [ "${{ inputs.dry-run }}" = "true" ]; then
             if prisma migrate status --schema=${{ inputs.schema-path }} >/dev/null 2>&1; then
               SUCCESS_COUNT=1
@@ -201,15 +206,15 @@ runs:
             fi
           fi
         fi
-        
+
         # Set outputs
         echo "databases-migrated=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
         echo "migration-summary<<EOF" >> $GITHUB_OUTPUT
         echo -e "$MIGRATION_RESULTS" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
-        
+
         echo "::endgroup::"
-        
+
         # Generate summary
         echo "## 🗄️ Prisma Migration Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
@@ -225,7 +230,7 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Details" >> $GITHUB_STEP_SUMMARY
         echo -e "$MIGRATION_RESULTS" >> $GITHUB_STEP_SUMMARY
-        
+
         # Exit with error if any migrations failed and not in dry-run mode
         if [ $SUCCESS_COUNT -ne $TOTAL_COUNT ] && [ "${{ inputs.dry-run }}" != "true" ]; then
           echo "::error::Some migrations failed. Check the logs for details."

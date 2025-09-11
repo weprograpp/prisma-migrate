@@ -38,7 +38,7 @@ on:
       database-urls:
         description: 'Database URLs (use this instead of inputs.database-url for sensitive URLs)'
         required: false
-        
+
   workflow_dispatch:
     inputs:
       database-url:
@@ -76,11 +76,11 @@ jobs:
   migrate:
     name: Run Prisma Migrations
     runs-on: ubuntu-latest
-    
+
     outputs:
       databases-migrated: ${{ steps.run-migration.outputs.databases-migrated }}
       migration-summary: ${{ steps.run-migration.outputs.migration-summary }}
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -118,13 +118,13 @@ jobs:
           echo "**Workflow:** \`${{ github.workflow }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Run ID:** \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by:** \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "**Actor:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ steps.run-migration.outcome }}" = "success" ]; then
             echo "✅ **Status:** Migration completed successfully" >> $GITHUB_STEP_SUMMARY
             echo "📊 **Databases Migrated:** ${{ steps.run-migration.outputs.databases-migrated }}" >> $GITHUB_STEP_SUMMARY
