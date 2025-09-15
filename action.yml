@@ -1,15 +1,15 @@
 name: "Prisma Migrate (multi-DB, cached)"
 description: "Downloads/caches Prisma CLI and runs `prisma migrate deploy` across one or more DATABASE_URLs."
-author: "you"
+author: "Prograpp <contacto@prograpp.com.mx>"
 branding:
   icon: database
-  color: blue
+  color: gray-dark
 
 inputs:
   prisma-version:
-    description: "Prisma CLI version (e.g. 6.16.1 or latest)"
+    description: "Prisma CLI version (e.g. 5.22.0 or latest)"
     required: false
-    default: "latest"
+    default: "5.22.0"
   database-urls:
     description: "One or more DB URLs (JSON array or newline/comma separated)."
     required: true

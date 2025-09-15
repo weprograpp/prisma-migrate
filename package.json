@@ -19,7 +19,7 @@
     "url": "git+https://github.com/weprograpp/prisma-migrate.git"
   },
   "license": "Apache-2.0",
-  "author": "weprograpp <contacto@prograpp.com.mx>",
+  "author": "Prograpp <contacto@prograpp.com.mx>",
   "scripts": {
     "build": "ncc build src/index.ts -o dist --minify",
     "dev": "tsx src/index.ts"
