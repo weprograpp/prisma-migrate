@@ -1,0 +1,39 @@
+name: "Prisma Migrate (multi-DB, cached)"
+description: "Downloads/caches Prisma CLI and runs `prisma migrate deploy` across one or more DATABASE_URLs."
+author: "you"
+branding:
+  icon: database
+  color: blue
+
+inputs:
+  prisma-version:
+    description: "Prisma CLI version (e.g. 6.16.1 or latest)"
+    required: false
+    default: "latest"
+  database-urls:
+    description: "One or more DB URLs (JSON array or newline/comma separated)."
+    required: true
+  schema:
+    description: "Path to schema.prisma"
+    required: false
+    default: "prisma/schema.prisma"
+  prisma-args:
+    description: "Extra args to append to `prisma migrate deploy` (e.g. --force)."
+    required: false
+    default: ""
+  fail-fast:
+    description: "Fail immediately if any DB fails"
+    required: false
+    default: "true"
+  working-directory:
+    description: "Working directory for the Prisma project"
+    required: false
+    default: "."
+
+outputs:
+  results:
+    description: "JSON array with per-DB status and timings."
+
+runs:
+  using: "node20"
+  main: "dist/index.js"

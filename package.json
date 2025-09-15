@@ -1,0 +1,40 @@
+{
+  "name": "prisma-migrate",
+  "version": "0.1.0",
+  "description": "A Github Action package to run prisma migrate without the need of installing packages and losing pipeline time.",
+  "keywords": [
+    "actions",
+    "github",
+    "prisma",
+    "database",
+    "migration",
+    "migrate"
+  ],
+  "homepage": "https://github.com/weprograpp/prisma-migrate#readme",
+  "bugs": {
+    "url": "https://github.com/weprograpp/prisma-migrate/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weprograpp/prisma-migrate.git"
+  },
+  "license": "Apache-2.0",
+  "author": "weprograpp <contacto@prograpp.com.mx>",
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist --minify",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/exec": "^1.1.1",
+    "@actions/tool-cache": "^2.0.2",
+    "semver": "^7.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "tslib": "^2.7.0",
+    "typescript": "^5.6.2",
+    "@vercel/ncc": "^0.38.1",
+    "tsx": "^4.19.1"
+  }
+}

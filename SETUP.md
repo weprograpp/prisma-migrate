@@ -1,255 +1,124 @@
-# Setup and Troubleshooting Guide
+# Setup & Publishing guide
 
-## Initial Setup
+This file explains how to set up the project locally, build the action, run basic tests, and publish a release.
 
-### 1. Repository Secrets Setup
+---
 
-Go to your repository Settings → Secrets and variables → Actions, then add:
+## Prerequisites
 
-#### Single Database
-```
-DATABASE_URL = postgresql://username:password@host:port/database
-```
+- Node.js 18+ / 20 recommended
+- `npm` (or `pnpm`/`yarn`)
+- Git & GitHub access to publish releases
 
-#### Multiple Databases
-```
-DATABASE_URLS = ["postgresql://user:pass@host1:5432/db1", "postgresql://user:pass@host2:5432/db2"]
-```
+---
 
-#### Environment-specific Secrets
-```
-STAGING_DATABASE_URL = postgresql://user:pass@staging-host:5432/staging_db
-PRODUCTION_DATABASE_URL = postgresql://user:pass@prod-host:5432/prod_db
-```
+## Local dev & build
 
-### 2. Directory Structure
-
-Ensure your repository has the following structure:
-```
-your-repo/
-├── prisma/
-│   └── schema.prisma
-├── .github/
-│   └── workflows/
-│       └── your-workflow.yml
-└── ... (your project files)
-```
-
-### 3. Prisma Schema Requirements
-
-Your `prisma/schema.prisma` should have a valid datasource:
-
-```prisma
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql" // or "mysql", "sqlite", etc.
-  url      = env("DATABASE_URL")
-}
-
-// ... your models
-```
-
-## Common Issues and Solutions
-
-### Issue 1: "Schema file not found"
-
-**Error**: `Schema file not found at ./prisma/schema.prisma`
-
-**Solutions**:
-- Check that your schema file exists in the correct location
-- Update the `schema-path` input if your schema is in a different location
-- For monorepos, use `working-directory` input
-
-```yaml
-- uses: weprograpp/prisma-migrate/.github/actions/prisma-migrate@main
-  with:
-    database-url: ${{ secrets.DATABASE_URL }}
-    schema-path: 'apps/api/prisma/schema.prisma'  # Custom path
-    working-directory: 'apps/api'                  # Custom working directory
-```
-
-### Issue 2: "Database connection failed"
-
-**Error**: `Can't reach database server`
-
-**Solutions**:
-- Verify your DATABASE_URL format
-- Ensure the database server is accessible from GitHub Actions
-- Check firewall settings
-- Verify credentials and database name
-
-**Correct URL formats**:
+1. Clone the repo
 ```bash
-# PostgreSQL
-postgresql://username:password@host:port/database
+git clone git@github.com:your-org/action-prisma-migrate.git
+cd action-prisma-migrate
+````
 
-# MySQL
-mysql://username:password@host:port/database
+2. Install deps
 
-# SQLite (file-based)
-file:./dev.db
-```
-
-### Issue 3: "Invalid JSON array for multiple databases"
-
-**Error**: `Error parsing database URLs`
-
-**Solutions**:
-- Ensure JSON array syntax is correct
-- Use proper escaping in secrets
-- Test JSON validity
-
-**Correct format**:
-```json
-[
-  "postgresql://user:pass@host1:5432/db1",
-  "postgresql://user:pass@host2:5432/db2"
-]
-```
-
-**In GitHub Secrets** (no escaping needed):
-```
-["postgresql://user:pass@host1:5432/db1", "postgresql://user:pass@host2:5432/db2"]
-```
-
-### Issue 4: "Migration failed" with no clear error
-
-**Solutions**:
-1. Run in dry-run mode first to preview changes:
-   ```yaml
-   with:
-     database-url: ${{ secrets.DATABASE_URL }}
-     dry-run: true
-   ```
-
-2. Check the migration status manually:
-   ```bash
-   npx prisma migrate status
-   ```
-
-3. Ensure migrations are committed to your repository:
-   ```
-   prisma/
-   └── migrations/
-       ├── 20240101000000_init/
-       │   └── migration.sql
-       └── migration_lock.toml
-   ```
-
-### Issue 5: "Prisma version mismatch"
-
-**Error**: `CLI version doesn't match schema requirements`
-
-**Solution**: Specify the exact Prisma version:
-```yaml
-- uses: weprograpp/prisma-migrate/.github/actions/prisma-migrate@main
-  with:
-    database-url: ${{ secrets.DATABASE_URL }}
-    prisma-version: '5.0.0'  # Match your project's version
-```
-
-### Issue 6: "Concurrency control conflicts"
-
-**Error**: `Another migration is already running`
-
-This is actually a safety feature. Solutions:
-- Wait for the current migration to complete
-- Cancel the conflicting workflow if it's stuck
-- The concurrency group is: `prisma-migrate-${{ github.repository }}`
-
-### Issue 7: "Missing environment variables"
-
-**Error**: `Environment variable not found: DATABASE_URL`
-
-This happens when using the composite action directly. Solutions:
-1. The action sets DATABASE_URL automatically from the input
-2. If you need additional env vars, set them explicitly:
-   ```yaml
-   - uses: weprograpp/prisma-migrate/.github/actions/prisma-migrate@main
-     env:
-       CUSTOM_VAR: ${{ secrets.CUSTOM_VAR }}
-     with:
-       database-url: ${{ secrets.DATABASE_URL }}
-   ```
-
-## Debugging Tips
-
-### Enable Debug Logging
-
-Add this to your workflow for verbose output:
-```yaml
-env:
-  ACTIONS_STEP_DEBUG: true
-  ACTIONS_RUNNER_DEBUG: true
-```
-
-### Test Locally
-
-Before using in CI/CD, test your migrations locally:
 ```bash
-# Set your database URL
-export DATABASE_URL="postgresql://..."
-
-# Check migration status
-npx prisma migrate status
-
-# Preview migrations (dry run)
-npx prisma migrate diff --from-schema-datamodel prisma/schema.prisma --to-schema-datasource prisma/schema.prisma
-
-# Apply migrations
-npx prisma migrate deploy
+npm install
 ```
 
-### Check Action Summaries
+3. Build the action (bundles TypeScript into `dist/index.js`)
 
-The action generates detailed summaries in the GitHub Actions interface. Look for:
-- Number of databases processed
-- Success/failure status for each database
-- Detailed error messages
+```bash
+npm run build
+# script: "build": "ncc build src/index.ts -o dist --minify"
+```
 
-## Support
+4. Commit the build artifacts
 
-If you encounter issues not covered here:
+> GitHub recommends committing `dist/` for JS-based actions to avoid a build step during job runs.
 
-1. Check the [GitHub Actions logs] for detailed error messages
-2. Verify your Prisma schema syntax
-3. Test your database connection outside of GitHub Actions
-4. Review the [Prisma documentation](https://www.prisma.io/docs/concepts/components/prisma-migrate)
+```bash
+git add dist action.yml package.json package-lock.json
+git commit -m "build: dist for release"
+```
 
-## Advanced Configuration
+---
 
-### Custom Migration Timeout
+## Run & test locally with `act` (optional)
 
-For large migrations, you may need to increase timeouts:
+You can test workflows locally using `act`. `act` requires Docker and local secret definitions.
+
+```bash
+act -j migrate
+```
+
+This is optional and helpful for quick validations.
+
+---
+
+## Release & publish
+
+1. Tag a release:
+
+```bash
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin --tags
+```
+
+2. Create a GitHub Release (web UI or `gh` CLI). After tagging, add release notes and publish.
+
+3. (Optional) Publish to GitHub Marketplace:
+
+* Navigate to repository → Actions → Publish to Marketplace.
+* Provide README and example workflows.
+
+---
+
+## Recommended CI for this repo
+
+Create `.github/workflows/ci.yml` to run TypeScript checks, build and optional tests:
+
 ```yaml
+name: CI
+on: [push, pull_request]
 jobs:
-  migrate:
-    timeout-minutes: 30  # Increase from default 6 hours
-    uses: weprograpp/prisma-migrate/.github/workflows/prisma-migrate.yml@main
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run build
+      - run: npm test || true
 ```
 
-### Skip Migration Lock
+---
 
-⚠️ **Dangerous**: Only use if you understand the implications
+## Caching strategy for callers
+
+To speed up execution in workflows that call this action:
+
+1. Cache Prisma engines:
+
 ```yaml
-# This bypasses Prisma's migration lock mechanism
-# Only use in controlled environments
-env:
-  PRISMA_MIGRATE_SKIP_SEED: true
+- name: Cache Prisma & npm
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.cache/prisma
+      ~/.npm/_cacache
+    key: prisma-engines-${{ runner.os }}-${{ hashFiles('**/package-lock.json','**/pnpm-lock.yaml','**/yarn.lock') }}
 ```
 
-### Custom Node.js Version
+2. Pin `prisma-version` for deterministic runs.
 
-The action uses Node.js 18 by default. This is currently not customizable, but you can run setup steps before calling the action:
-```yaml
-steps:
-  - uses: actions/setup-node@v4
-    with:
-      node-version: '20'  # This will be overridden by the action
-  
-  - uses: weprograpp/prisma-migrate/.github/actions/prisma-migrate@main
-    # ... rest of configuration
-```
+---
+
+## Common troubleshooting
+
+* **`dist/index.js` missing**: run `npm run build` and commit `dist/`.
+* **Engine downloads taking long**: add the cache step above.
+* **DB connection fails**: validate secrets and network access; test locally with the same `DATABASE_URL`.
+* **I want a Docker variant**: build a Docker action image with Prisma preinstalled — I can provide a Dockerfile if needed.
