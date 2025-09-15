@@ -1,0 +1,133 @@
+name: Prisma Migrate Deploy
+
+on:
+  workflow_call:
+    inputs:
+      database-url:
+        description: 'Single database URL or JSON array of database URLs'
+        required: true
+        type: string
+      schema-path:
+        description: 'Path to Prisma schema file'
+        required: false
+        type: string
+        default: 'prisma/schema.prisma'
+      prisma-version:
+        description: 'Prisma version to use'
+        required: false
+        type: string
+        default: 'latest'
+      dry-run:
+        description: 'Run in dry-run mode (preview changes without applying)'
+        required: false
+        type: boolean
+        default: false
+      working-directory:
+        description: 'Working directory to run commands in'
+        required: false
+        type: string
+        default: '.'
+    outputs:
+      databases-migrated:
+        description: 'Number of databases successfully migrated'
+        value: ${{ jobs.migrate.outputs.databases-migrated }}
+      migration-summary:
+        description: 'Summary of migration results'
+        value: ${{ jobs.migrate.outputs.migration-summary }}
+    secrets:
+      database-urls:
+        description: 'Database URLs (use this instead of inputs.database-url for sensitive URLs)'
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      database-url:
+        description: 'Single database URL or JSON array of database URLs (use secrets.DATABASE_URLS for sensitive data)'
+        required: true
+        type: string
+        default: 'postgresql://user:password@localhost:5432/mydb'
+      schema-path:
+        description: 'Path to Prisma schema file'
+        required: false
+        type: string
+        default: 'prisma/schema.prisma'
+      prisma-version:
+        description: 'Prisma version to use'
+        required: false
+        type: string
+        default: 'latest'
+      dry-run:
+        description: 'Run in dry-run mode (preview changes without applying)'
+        required: false
+        type: boolean
+        default: true
+      working-directory:
+        description: 'Working directory to run commands in'
+        required: false
+        type: string
+        default: '.'
+
+# Ensure only one migration workflow runs at a time
+concurrency:
+  group: prisma-migrate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Run Prisma Migrations
+    runs-on: ubuntu-latest
+
+    outputs:
+      databases-migrated: ${{ steps.run-migration.outputs.databases-migrated }}
+      migration-summary: ${{ steps.run-migration.outputs.migration-summary }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine database URLs
+        id: db-urls
+        run: |
+          # Use secrets.database-urls if available, otherwise use input
+          if [ -n "${{ secrets.database-urls }}" ]; then
+            echo "Using database URLs from secrets"
+            echo "db-urls=${{ secrets.database-urls }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ secrets.DATABASE_URLS }}" ]; then
+            echo "Using DATABASE_URLS secret"
+            echo "db-urls=${{ secrets.DATABASE_URLS }}" >> $GITHUB_OUTPUT
+          else
+            echo "Using database URLs from input"
+            echo "db-urls=${{ inputs.database-url }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Prisma Migration
+        id: run-migration
+        uses: ./.github/actions/prisma-migrate
+        with:
+          database-url: ${{ steps.db-urls.outputs.db-urls }}
+          schema-path: ${{ inputs.schema-path }}
+          prisma-version: ${{ inputs.prisma-version }}
+          dry-run: ${{ inputs.dry-run }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Generate workflow summary
+        if: always()
+        run: |
+          echo "## 🚀 Prisma Migration Workflow Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** \`${{ github.workflow }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "**Actor:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.run-migration.outcome }}" = "success" ]; then
+            echo "✅ **Status:** Migration completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "📊 **Databases Migrated:** ${{ steps.run-migration.outputs.databases-migrated }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Status:** Migration failed" >> $GITHUB_STEP_SUMMARY
+          fi
