@@ -1,5 +1,5 @@
-name: "Prisma Migrate (multi-DB, cached)"
-description: "Downloads/caches Prisma CLI and runs `prisma migrate deploy` across one or more DATABASE_URLs."
+name: "Prisma Operations (cached)"
+description: "Downloads a selected Prisma CLI version, restores a persisted cache, and runs generate, migrate deploy, and/or db seed."
 author: "Prograpp <contacto@prograpp.com.mx>"
 branding:
   icon: database
@@ -7,33 +7,91 @@ branding:
 
 inputs:
   prisma-version:
-    description: "Prisma CLI version (e.g. 5.22.0 or latest)"
+    description: "Prisma CLI version, tag, or semver range (for example 5.22.0, latest, or ^5.22.0)"
     required: false
     default: "5.22.0"
-  database-urls:
-    description: "One or more DB URLs (JSON array or newline/comma separated)."
-    required: true
-  schema:
-    description: "Path to schema.prisma"
-    required: false
-    default: "prisma/schema.prisma"
-  prisma-args:
-    description: "Extra args to append to `prisma migrate deploy` (e.g. --force)."
-    required: false
-    default: ""
-  fail-fast:
-    description: "Fail immediately if any DB fails"
-    required: false
-    default: "true"
   working-directory:
     description: "Working directory for the Prisma project"
     required: false
     default: "."
+  schema:
+    description: "Path to schema.prisma"
+    required: false
+    default: "prisma/schema.prisma"
+  database-url:
+    description: "Single DATABASE_URL for generate, migrate, and seed"
+    required: false
+  database-urls:
+    description: "One or more DATABASE_URL values (JSON array or newline/comma separated)"
+    required: false
+  generate:
+    description: "Run prisma generate"
+    required: false
+    default: "false"
+  migrate:
+    description: "Run prisma migrate deploy"
+    required: false
+    default: "true"
+  seed:
+    description: "Run prisma db seed"
+    required: false
+    default: "false"
+  prisma-args:
+    description: "Extra args appended to prisma migrate deploy"
+    required: false
+    default: ""
+  fail-fast:
+    description: "Stop after the first failed database operation"
+    required: false
+    default: "true"
 
 outputs:
   results:
-    description: "JSON array with per-DB status and timings."
+    description: "JSON array with per-operation status and timings."
+    value: ${{ steps.prisma.outputs.results }}
 
 runs:
-  using: "node20"
-  main: "dist/index.js"
+  using: "composite"
+  steps:
+    - name: Resolve Prisma version
+      id: resolve-prisma
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${{ inputs.prisma-version }}"
+        if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?(\+[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$'; then
+          RESOLVED_VERSION="$VERSION"
+        else
+          RESOLVED_VERSION="$(npm view "prisma@${VERSION}" version)" \
+            || { echo "Failed to resolve Prisma version '${VERSION}'. Check the prisma-version input."; exit 1; }
+        fi
+        echo "resolved_prisma_version=${RESOLVED_VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Prisma cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/prisma-migrate
+        key: prisma-migrate-cache-${{ runner.os }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
+        restore-keys: |
+          prisma-migrate-cache-${{ runner.os }}-
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Run Prisma operations
+      id: prisma
+      shell: bash
+      env:
+        INPUT_PRISMA_VERSION: ${{ inputs.prisma-version }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_SCHEMA: ${{ inputs.schema }}
+        INPUT_DATABASE_URL: ${{ inputs.database-url }}
+        INPUT_DATABASE_URLS: ${{ inputs.database-urls }}
+        INPUT_GENERATE: ${{ inputs.generate }}
+        INPUT_MIGRATE: ${{ inputs.migrate }}
+        INPUT_SEED: ${{ inputs.seed }}
+        INPUT_PRISMA_ARGS: ${{ inputs.prisma-args }}
+        INPUT_FAIL_FAST: ${{ inputs.fail-fast }}
+      run: node "${{ github.action_path }}/dist/index.js"

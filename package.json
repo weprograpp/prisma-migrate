@@ -1,14 +1,16 @@
 {
   "name": "prisma-migrate",
-  "version": "0.1.0",
-  "description": "A Github Action package to run prisma migrate without the need of installing packages and losing pipeline time.",
+  "version": "0.2.0",
+  "description": "A GitHub Action package for cached Prisma generate, migrate, and seed operations.",
   "keywords": [
     "actions",
     "github",
     "prisma",
     "database",
     "migration",
-    "migrate"
+    "migrate",
+    "seed",
+    "generate"
   ],
   "homepage": "https://github.com/weprograpp/prisma-migrate#readme",
   "bugs": {

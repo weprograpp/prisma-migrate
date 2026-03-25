@@ -1,262 +1,77 @@
-# Prisma Migrate GitHub Action
+# Prisma Operations GitHub Action
 
-**Action**: `prisma-migrate`  
-**Purpose**: Download/cache the Prisma CLI and run `prisma migrate deploy` against one or many databases from other workflows.
+Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma version you request, caches it, and runs `generate`, `migrate deploy`, and/or `db seed` without requiring callers to run `npx prisma`.
 
-This repo contains a reusable GitHub Action (Node / TypeScript) that:
+## What it does
 
-- Downloads & caches the Prisma npm package (so callers *don't* need to `npm i prisma` every time).
-- Exposes a small CLI-style action that runs `prisma migrate deploy` for each `DATABASE_URL` you pass (supports single URL, newline/comma separated, or JSON array).
-- Lets you point to a custom `schema.prisma` and pass extra `prisma` args.
-- Runs migrations sequentially (to avoid DB locks); workflows can parallelize via a matrix if desired.
+- Supports `prisma-version` selection, including exact versions like `5.22.0`, tags like `latest`, and semver ranges.
+- Runs `prisma generate`, `prisma migrate deploy`, and `prisma db seed` independently.
+- Supports one `database-url` or many `database-urls`.
+- Keeps the Prisma download cached between runs.
 
----
+## Inputs
 
-## Features
+| Input | Description | Default |
+| --- | --- | --- |
+| `prisma-version` | Prisma CLI version, tag, or semver range | `5.22.0` |
+| `working-directory` | Working directory for the Prisma project | `.` |
+| `schema` | Path to `schema.prisma` | `prisma/schema.prisma` |
+| `database-url` | Single `DATABASE_URL` | _empty_ |
+| `database-urls` | One or more `DATABASE_URL` values | _empty_ |
+| `generate` | Run `prisma generate` | `false` |
+| `migrate` | Run `prisma migrate deploy` | `true` |
+| `seed` | Run `prisma db seed` | `false` |
+| `prisma-args` | Extra args appended to `prisma migrate deploy` | _empty_ |
+| `fail-fast` | Stop after the first failed database operation | `true` |
 
-- ✅ **Single or Multiple Databases**: Support for single database URL or JSON array of URLs
-- 🔒 **Secret Masking**: Automatically masks database URLs in logs
-- 🚀 **Sequential Execution**: Runs migrations sequentially with built-in concurrency control
-- 🔍 **Dry Run Support**: Preview migrations without applying changes
-- 📊 **Detailed Summaries**: Generates comprehensive reports via `$GITHUB_STEP_SUMMARY`
-- 🛡️ **No Resets**: Designed specifically for `migrate deploy` (no destructive operations)
-- ⚙️ **Configurable**: Custom Prisma versions, schema paths, and working directories
+## Outputs
 
----
-
-## Inputs & Outputs
-
-### Inputs
-
-| Input               | Description                                                             | Required | Default                |
-|---------------------|-------------------------------------------------------------------------|----------|------------------------|
-| `database-url`      | Single database URL or JSON array of database URLs                      | ✅ Yes | -                      |
-| `schema`            | Path to Prisma schema file                                              | ❌ No | `prisma/schema.prisma` |
-| `prisma-version`    | Prisma version to use                                                   | ❌ No | `5.22.0`               |
-| `fail-fast`         | Stop on first failre (and don't apply migrations to any other database) | ❌ No | `true`                 |
-| `prisma-args`       | Extra args to pass to `prisma migrate deploy`                           | ❌ No | _empty_                |
-| `working-directory` | Working directory to run commands in                                    | ❌ No | `.`                    |
-
-- `prisma-version` — (optional) Prisma CLI version, e.g. `6.16.1` or `latest` (default `latest`).
-- `database-urls` — (required) One or more DB URLs. Accepts:
-  - JSON array: `["postgres://...","mysql://..."]`
-  - Newline or comma-separated list
-- `schema` — (optional) path to `schema.prisma` (default: `prisma/schema.prisma`).
-- `prisma-args` — (optional) extra args appended to `prisma migrate deploy` (e.g. `--force`).
-- `fail-fast` — (optional) `"true"`/`"false"`, stop on first failure. Default: `"true"`.
-- `working-directory` — (optional) working dir (default: `.`).
-
-### Outputs
-- `results` — JSON array of `{ databaseUrlMasked, ok, exitCode, ms }` for each DB.
-
----
-
-## Quickstart
-
-1. Add this action to a workflow (see `EXAMPLES.md` for multiple usage patterns).
-2. Provide DB URLs as secrets and/or inputs.
-3. Optionally cache Prisma engines using `actions/cache` for speed.
-
-Example (short):
-
-```yaml
-- name: Run Prisma Migrate
-  uses: your-org/action-prisma-migrate@v1
-  with:
-    prisma-version: "latest"
-    schema: "apps/api/prisma/schema.prisma"
-    database-urls: |
-      ${{ secrets.DATABASE_URL }}
-      ${{ secrets.REPLICA_DATABASE_URL }}
-    prisma-args: "--telemetry-information=false"
-    fail-fast: "true"
-````
-
----
-
-## Security & secrets
-
-* Always pass DB URLs via GitHub Secrets (e.g. `secrets.DATABASE_URL`).
-* The action calls `core.setSecret` on each DB URL so it is redacted from logs; **still** treat secrets carefully.
-* Avoid printing full URLs or dumping environment in logs.
-
----
-
-## Troubleshooting
-
-* **First run downloads engines** — the first time a new Prisma version is used it will download engines; subsequent runs are faster if you cache `~/.cache/prisma`.
-* **Lock errors between DBs** — migrations run sequentially. If you need parallelism, run separate jobs with a matrix (one DB per job).
-* **Action fails but logs show a non-zero code** — check `results` output and the per-DB logs; consider `fail-fast: "false"` to collect status from all DBs.
-* **CLI entry not found** — ensure `action` built and `dist/index.js` exists (see `SETUP.md`).
-
----
-
-## Contributing & Releases
-
-1. Fork the repo and create a feature branch.
-2. Make your changes and add tests if applicable.
-3. Open a pull request against `main`.
-4. After review and merge, create a new release via GitHub UI or CLI.
-5. The release will trigger a GitHub Action to build and publish the new version to npm.
+| Output | Description |
+| --- | --- |
+| `results` | JSON array with per-operation timings and status |
 
 ## Examples
 
-Below are practical examples you can copy into your workflows.
-
----
-
-### 1) Single database (simple)
+### Migration only
 
 ```yaml
-name: Migrate single DB
-
-on:
-  push:
-    branches: [ main ]
-
-jobs:
-  migrate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Prisma Migrate
-        uses: your-org/action-prisma-migrate@v1
-        with:
-          prisma-version: "latest"
-          schema: "prisma/schema.prisma"
-          database-urls: ${{ secrets.DATABASE_URL }}
-          prisma-args: ""
-          fail-fast: "true"
-````
-
----
-
-### 2) Multiple DBs — JSON array
-
-```yaml
-- name: Run Prisma Migrate (many DBs)
-  uses: your-org/action-prisma-migrate@v1
+- name: Run Prisma migrate
+  uses: weprograpp/prisma-migrate@v1
   with:
-    prisma-version: "6.16.1"
-    schema: "apps/api/prisma/schema.prisma"
-    database-urls: '["${{ secrets.PROD_DATABASE_URL }}","${{ secrets.REPLICA_DATABASE_URL }}"]'
-    prisma-args: "--telemetry-information=false"
-    fail-fast: "false"
+    prisma-version: "5.22.0"
+    database-url: ${{ secrets.DATABASE_URL }}
 ```
 
-> Tip: wrap the JSON array in single quotes so YAML parsing doesn't break.
-
----
-
-### 3) Comma / newline separated list
+### Full bootstrap
 
 ```yaml
-database-urls: |
-  ${{ secrets.DB_PRIMARY }}
-  ${{ secrets.DB_SECONDARY }}
-  ${{ secrets.DB_REPORTING }}
-```
-
-The action will split on newlines and commas and process each entry.
-
----
-
-### 4) Parallelize per-database (matrix)
-
-If you prefer running each DB in parallel to speed up pipeline time:
-
-```yaml
-jobs:
-  migrate:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        db-url: [ ${{ secrets.DB_1 }}, ${{ secrets.DB_2 }} ]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Prisma for one DB
-        uses: your-org/action-prisma-migrate@v1
-        with:
-          prisma-version: latest
-          database-urls: ${{ matrix.db-url }}
-          schema: prisma/schema.prisma
-```
-
----
-
-### 5) Monorepo: Use `working-directory`
-
-```yaml
-with:
-  prisma-version: "latest"
-  working-directory: "apps/api"
-  schema: "prisma/schema.prisma"
-  database-urls: ${{ secrets.APP_API_DB }}
-```
-
----
-
-### 6) Read the output
-
-After the step finishes, `results` will be available as an output of the action step:
-
-```yaml
-- name: Run Prisma
-  id: migrate
-  uses: your-org/action-prisma-migrate@v1
+- name: Generate, migrate, and seed
+  uses: weprograpp/prisma-migrate@v1
   with:
-    prisma-version: latest
-    database-urls: ${{ secrets.DB }}
-
-- name: Show results
-  run: echo "${{ steps.migrate.outputs.results }}"
+    prisma-version: "5.22.0"
+    working-directory: "platsage"
+    schema: "prisma/schema.prisma"
+    database-url: ${{ secrets.DATABASE_CONNECTION_STRING }}
+    generate: "true"
+    migrate: "true"
+    seed: "true"
 ```
 
-Example JSON output:
+If your schema uses `env("DATABASE_URL")`, pass a database URL even for `generate` so Prisma can resolve the datasource environment variable.
 
-```json
-[
-  {"databaseUrlMasked":"postgres://***:***@...","ok":true,"exitCode":0,"ms":1023},
-  {"databaseUrlMasked":"mysql://***:***@...","ok":false,"exitCode":2,"ms":4567}
-]
+## Notes
+
+- `database-urls` accepts a JSON array, a newline-separated list, or a comma-separated list.
+- `prisma-args` is passed to `prisma migrate deploy` only.
+- If multiple database URLs are provided, `generate` uses the first one to satisfy schemas that rely on `DATABASE_URL`.
+- The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`, and the cache key is scoped by the requested `prisma-version`.
+- Set `PRISMA_MIGRATE_CACHE_DIR` if you want to store the downloaded Prisma versions in a custom cache location.
+
+## Build
+
+```bash
+npm install
+npm run build
 ```
 
----
-
-### 7) Performance: cache Prisma engines
-
-Recommended to cache Prisma engine downloads across runs:
-
-```yaml
-- name: Cache Prisma & npm
-  uses: actions/cache@v4
-  with:
-    path: |
-      ~/.cache/prisma
-      ~/.npm/_cacache
-    key: prisma-engines-${{ runner.os }}-${{ hashFiles('**/package-lock.json','**/pnpm-lock.yaml','**/yarn.lock') }}
-```
-
-This reduces first-run downloads for Prisma engines.
-
----
-
-# Security
-
-- All database URLs are automatically masked in GitHub Actions logs
-- Use GitHub Secrets to store sensitive database connection strings
-- No database credentials are logged or exposed in workflow summaries
-
-# Versioning
-We recommend pinning to the latest available major version:
-
-```yaml
-- uses: '@weprograpp/prisma-migrate@v1'
-```
-  While this action attempts to follow semantic versioning, but we're ultimately human and sometimes make mistakes. To prevent accidental breaking changes, you can also pin to a specific version:
-
-```yaml
-- uses: '@weprograpp/prisma-migrate@v1.0.0'
-```
-  However, you will not get automatic security updates or new features without explicitly updating your version number. Note that we only publish MAJOR and MAJOR.MINOR.PATCH versions. There is not a floating alias for MAJOR.MINOR.
+The bundled `dist/index.js` is committed so the action can be consumed directly from GitHub.
