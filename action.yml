@@ -53,11 +53,25 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Resolve Prisma version
+      id: resolve-prisma
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${{ inputs.prisma-version }}"
+        if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?(\+[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)*)?$'; then
+          RESOLVED_VERSION="$VERSION"
+        else
+          RESOLVED_VERSION="$(npm view "prisma@${VERSION}" version)" \
+            || { echo "Failed to resolve Prisma version '${VERSION}'. Check the prisma-version input."; exit 1; }
+        fi
+        echo "resolved_prisma_version=${RESOLVED_VERSION}" >> "$GITHUB_OUTPUT"
+
     - name: Restore Prisma cache
       uses: actions/cache@v4
       with:
         path: ~/.cache/prisma-migrate
-        key: prisma-migrate-cache-${{ runner.os }}-${{ inputs.prisma-version }}
+        key: prisma-migrate-cache-${{ runner.os }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
         restore-keys: |
           prisma-migrate-cache-${{ runner.os }}-
 
@@ -70,7 +84,6 @@ runs:
       id: prisma
       shell: bash
       env:
-        PRISMA_MIGRATE_CACHE_DIR: ~/.cache/prisma-migrate
         INPUT_PRISMA_VERSION: ${{ inputs.prisma-version }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_SCHEMA: ${{ inputs.schema }}

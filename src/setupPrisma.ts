@@ -70,7 +70,21 @@ async function resolvePrisma(versionInput: string) {
 }
 
 function getCacheRoot() {
-  return process.env.PRISMA_MIGRATE_CACHE_DIR?.trim() || path.join(os.homedir(), ".cache", "prisma-migrate");
+  const raw = process.env.PRISMA_MIGRATE_CACHE_DIR?.trim();
+
+  if (!raw) {
+    return path.join(os.homedir(), ".cache", "prisma-migrate");
+  }
+
+  if (raw === "~") {
+    return os.homedir();
+  }
+
+  if (raw.startsWith("~/")) {
+    return path.join(os.homedir(), raw.slice(2));
+  }
+
+  return raw;
 }
 
 async function copyExtractedCli(sourceDir: string, targetDir: string) {
