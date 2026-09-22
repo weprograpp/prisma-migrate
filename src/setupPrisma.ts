@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import * as exec from "@actions/exec";
 import * as tc from "@actions/tool-cache";
 import semver from "semver";
 import * as fs from "node:fs";
@@ -93,6 +94,14 @@ async function copyExtractedCli(sourceDir: string, targetDir: string) {
   await fs.promises.cp(sourceDir, targetDir, { recursive: true });
 }
 
+async function installRuntimeDependencies(packageDir: string) {
+  await exec.exec(
+    "npm",
+    ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock"],
+    { cwd: packageDir }
+  );
+}
+
 export async function ensurePrismaCli(versionInput: string) {
   const resolved = await resolvePrisma(versionInput);
   const cacheRoot = getCacheRoot();
@@ -100,17 +109,23 @@ export async function ensurePrismaCli(versionInput: string) {
   const rootCacheDir = path.join(cacheRoot, resolved.version);
   const packageCachedCli = path.join(packageCacheDir, "build", "index.js");
   const rootCachedCli = path.join(rootCacheDir, "build", "index.js");
+  const cachedEnginesPackage = path.join(
+    packageCacheDir,
+    "node_modules",
+    "@prisma",
+    "engines",
+    "package.json"
+  );
 
-  if (fs.existsSync(packageCachedCli)) {
+  if (fs.existsSync(packageCachedCli) && fs.existsSync(cachedEnginesPackage)) {
     core.info(`Prisma CLI cache hit: ${resolved.version}`);
     core.addPath(path.dirname(packageCachedCli));
     return packageCachedCli;
   }
 
-  if (fs.existsSync(rootCachedCli)) {
-    core.info(`Prisma CLI cache hit: ${resolved.version}`);
-    core.addPath(path.dirname(rootCachedCli));
-    return rootCachedCli;
+  if (fs.existsSync(packageCachedCli) || fs.existsSync(rootCachedCli)) {
+    core.info(`Discarding incomplete Prisma CLI cache: ${resolved.version}`);
+    await fs.promises.rm(rootCacheDir, { recursive: true, force: true });
   }
 
   core.info(`Downloading Prisma CLI ${resolved.version}...`);
@@ -123,10 +138,10 @@ export async function ensurePrismaCli(versionInput: string) {
   let cachedCli = "";
   if (fs.existsSync(extractedPackageCli)) {
     await copyExtractedCli(path.join(extracted, "package"), packageCacheDir);
+    await installRuntimeDependencies(packageCacheDir);
     cachedCli = packageCachedCli;
   } else if (fs.existsSync(extractedRootCli)) {
-    await copyExtractedCli(extracted, rootCacheDir);
-    cachedCli = rootCachedCli;
+    throw new Error(`Unexpected Prisma CLI package layout at ${extracted}`);
   } else {
     throw new Error(`Prisma CLI entry not found in extracted tarball at ${extracted}`);
   }

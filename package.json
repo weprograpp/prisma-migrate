@@ -1,6 +1,6 @@
 {
   "name": "prisma-migrate",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A GitHub Action package for cached Prisma generate, migrate, and seed operations.",
   "keywords": [
     "actions",

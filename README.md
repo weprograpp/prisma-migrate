@@ -65,6 +65,7 @@ If your schema uses `env("DATABASE_URL")`, pass a database URL even for `generat
 - `prisma-args` is passed to `prisma migrate deploy` only.
 - If multiple database URLs are provided, `generate` uses the first one to satisfy schemas that rely on `DATABASE_URL`.
 - The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`, and the cache key is scoped by the requested `prisma-version`.
+- A downloaded Prisma CLI is cached only after its runtime dependencies are installed. Incomplete caches from older action versions are discarded automatically.
 - Set `PRISMA_MIGRATE_CACHE_DIR` if you want to store the downloaded Prisma versions in a custom cache location.
 
 ## Build
