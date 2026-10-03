@@ -6,6 +6,10 @@ branding:
   color: gray-dark
 
 inputs:
+  mode:
+    description: "prepare installs/caches the runtime; execute runs the selected Prisma operations"
+    required: false
+    default: "execute"
   prisma-version:
     description: "Prisma CLI version, tag, or semver range (for example 5.22.0, latest, or ^5.22.0)"
     required: false
@@ -14,6 +18,9 @@ inputs:
     description: "Working directory for the Prisma project"
     required: false
     default: "."
+  runtime-directory:
+    description: "Prepared runtime directory returned by a previous mode=prepare invocation"
+    required: false
   schema:
     description: "Path to schema.prisma"
     required: false
@@ -46,6 +53,12 @@ inputs:
     default: "true"
 
 outputs:
+  runtime-directory:
+    description: "Absolute path to the prepared Prisma runtime."
+    value: ${{ steps.prisma.outputs.runtime-directory }}
+  setup-ms:
+    description: "Milliseconds spent restoring or preparing the runtime."
+    value: ${{ steps.prisma.outputs.setup-ms }}
   results:
     description: "JSON array with per-operation status and timings."
     value: ${{ steps.prisma.outputs.results }}
@@ -55,6 +68,7 @@ runs:
   steps:
     - name: Resolve Prisma version
       id: resolve-prisma
+      if: inputs.runtime-directory == ''
       shell: bash
       run: |
         set -euo pipefail
@@ -68,14 +82,16 @@ runs:
         echo "resolved_prisma_version=${RESOLVED_VERSION}" >> "$GITHUB_OUTPUT"
 
     - name: Restore Prisma cache
+      if: inputs.runtime-directory == ''
       uses: actions/cache@v4
       with:
         path: ~/.cache/prisma-migrate
-        key: prisma-migrate-cache-${{ runner.os }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
+        key: prisma-migrate-runtime-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
         restore-keys: |
-          prisma-migrate-cache-${{ runner.os }}-
+          prisma-migrate-runtime-v2-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Setup Node.js
+      if: inputs.runtime-directory == ''
       uses: actions/setup-node@v4
       with:
         node-version: 20
@@ -84,8 +100,10 @@ runs:
       id: prisma
       shell: bash
       env:
+        INPUT_MODE: ${{ inputs.mode }}
         INPUT_PRISMA_VERSION: ${{ inputs.prisma-version }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_RUNTIME_DIRECTORY: ${{ inputs.runtime-directory }}
         INPUT_SCHEMA: ${{ inputs.schema }}
         INPUT_DATABASE_URL: ${{ inputs.database-url }}
         INPUT_DATABASE_URLS: ${{ inputs.database-urls }}

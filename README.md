@@ -1,6 +1,6 @@
 # Prisma Operations GitHub Action
 
-Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma version you request, caches it, and runs `generate`, `migrate deploy`, and/or `db seed` without requiring callers to run `npx prisma`.
+Reusable GitHub Action for cached Prisma execution. It prepares the Prisma CLI, client, engines, and `tsx`, then runs `generate`, `migrate deploy`, and/or `db seed` without requiring callers to run `npm ci` or `npx prisma`.
 
 ## What it does
 
@@ -8,13 +8,16 @@ Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma 
 - Runs `prisma generate`, `prisma migrate deploy`, and `prisma db seed` independently.
 - Supports one `database-url` or many `database-urls`.
 - Keeps the Prisma download cached between runs.
+- Can prepare the runtime while infrastructure is provisioning, then execute migrations after the database exists.
 
 ## Inputs
 
 | Input | Description | Default |
 | --- | --- | --- |
+| `mode` | `prepare` installs/restores the runtime; `execute` runs operations | `execute` |
 | `prisma-version` | Prisma CLI version, tag, or semver range | `5.22.0` |
 | `working-directory` | Working directory for the Prisma project | `.` |
+| `runtime-directory` | Runtime returned by a previous `prepare` step | _empty_ |
 | `schema` | Path to `schema.prisma` | `prisma/schema.prisma` |
 | `database-url` | Single `DATABASE_URL` | _empty_ |
 | `database-urls` | One or more `DATABASE_URL` values | _empty_ |
@@ -28,6 +31,8 @@ Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma 
 
 | Output | Description |
 | --- | --- |
+| `runtime-directory` | Absolute path to the prepared runtime |
+| `setup-ms` | Runtime preparation/restore time in milliseconds |
 | `results` | JSON array with per-operation timings and status |
 
 ## Examples
@@ -36,7 +41,7 @@ Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma 
 
 ```yaml
 - name: Run Prisma migrate
-  uses: weprograpp/prisma-migrate@v1
+  uses: weprograpp/prisma-migrate@v0.2.1
   with:
     prisma-version: "5.22.0"
     database-url: ${{ secrets.DATABASE_URL }}
@@ -46,11 +51,39 @@ Reusable GitHub Action for cached Prisma CLI execution. It downloads the Prisma 
 
 ```yaml
 - name: Generate, migrate, and seed
-  uses: weprograpp/prisma-migrate@v1
+  uses: weprograpp/prisma-migrate@v0.2.1
   with:
     prisma-version: "5.22.0"
     working-directory: "platsage"
     schema: "prisma/schema.prisma"
+    database-url: ${{ secrets.DATABASE_CONNECTION_STRING }}
+    generate: "true"
+    migrate: "true"
+    seed: "true"
+```
+
+### Prepare while infrastructure is provisioning
+
+Start the infrastructure build first, then prepare Prisma before waiting for the database:
+
+```yaml
+- name: Prepare Prisma runtime
+  id: prisma-prepare
+  uses: weprograpp/prisma-migrate@v0.3.0
+  with:
+    mode: prepare
+    prisma-version: "5.22.0"
+    working-directory: "tavaro"
+
+- name: Wait for database infrastructure
+  run: ./wait-for-infrastructure.sh
+
+- name: Migrate and seed
+  uses: weprograpp/prisma-migrate@v0.3.0
+  with:
+    mode: execute
+    runtime-directory: ${{ steps.prisma-prepare.outputs.runtime-directory }}
+    working-directory: "tavaro"
     database-url: ${{ secrets.DATABASE_CONNECTION_STRING }}
     generate: "true"
     migrate: "true"
@@ -64,8 +97,8 @@ If your schema uses `env("DATABASE_URL")`, pass a database URL even for `generat
 - `database-urls` accepts a JSON array, a newline-separated list, or a comma-separated list.
 - `prisma-args` is passed to `prisma migrate deploy` only.
 - If multiple database URLs are provided, `generate` uses the first one to satisfy schemas that rely on `DATABASE_URL`.
-- The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`, and the cache key is scoped by the requested `prisma-version`.
-- A downloaded Prisma CLI is cached only after its runtime dependencies are installed. Incomplete caches from older action versions are discarded automatically.
+- The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`; the cache key is scoped by OS, architecture, runtime revision, and Prisma version.
+- The prepared runtime is linked into the working directory only when it does not already have `node_modules`. Existing project dependencies are never replaced.
 - Set `PRISMA_MIGRATE_CACHE_DIR` if you want to store the downloaded Prisma versions in a custom cache location.
 
 ## Build

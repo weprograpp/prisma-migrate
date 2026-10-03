@@ -1,15 +1,23 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
-import * as tc from "@actions/tool-cache";
 import semver from "semver";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 
+const RUNTIME_REVISION = "2";
+const TSX_VERSION = "4.19.1";
+
 type NpmMeta = {
   "dist-tags": Record<string, string>;
-  versions: Record<string, { dist: { tarball: string } }>;
+  versions: Record<string, unknown>;
+};
+
+export type PrismaRuntime = {
+  version: string;
+  directory: string;
+  cliEntry: string;
 };
 
 function fetchJson<T = unknown>(url: string): Promise<T> {
@@ -35,121 +43,147 @@ function fetchJson<T = unknown>(url: string): Promise<T> {
   });
 }
 
-function resolveVersion(requestedVersion: string, meta: NpmMeta): string {
+export function resolveVersion(requestedVersion: string, meta: NpmMeta): string {
   const normalized = requestedVersion.trim();
 
-  if (!normalized || normalized === "latest") {
-    return meta["dist-tags"].latest;
-  }
-
-  if (meta.versions[normalized]) {
-    return normalized;
-  }
+  if (!normalized || normalized === "latest") return meta["dist-tags"].latest;
+  if (meta.versions[normalized]) return normalized;
 
   const taggedVersion = meta["dist-tags"][normalized];
-  if (taggedVersion && meta.versions[taggedVersion]) {
-    return taggedVersion;
-  }
+  if (taggedVersion && meta.versions[taggedVersion]) return taggedVersion;
 
   const availableVersions = Object.keys(meta.versions).filter((version) => semver.valid(version));
   const matchedVersion = semver.maxSatisfying(availableVersions, normalized, {
     includePrerelease: true
   });
 
-  if (matchedVersion) {
-    return matchedVersion;
-  }
-
+  if (matchedVersion) return matchedVersion;
   throw new Error(`Could not resolve Prisma version: ${requestedVersion}`);
 }
 
-async function resolvePrisma(versionInput: string) {
+async function resolvePrismaVersion(versionInput: string) {
+  if (semver.valid(versionInput.trim())) return versionInput.trim();
   const meta = await fetchJson<NpmMeta>("https://registry.npmjs.org/prisma");
-  const version = resolveVersion(versionInput, meta);
-  const tarball = meta.versions[version].dist.tarball;
-  return { version, tarball };
+  return resolveVersion(versionInput, meta);
 }
 
-function getCacheRoot() {
+export function getCacheRoot() {
   const raw = process.env.PRISMA_MIGRATE_CACHE_DIR?.trim();
-
-  if (!raw) {
-    return path.join(os.homedir(), ".cache", "prisma-migrate");
-  }
-
-  if (raw === "~") {
-    return os.homedir();
-  }
-
-  if (raw.startsWith("~/")) {
-    return path.join(os.homedir(), raw.slice(2));
-  }
-
-  return raw;
+  if (!raw) return path.join(os.homedir(), ".cache", "prisma-migrate");
+  if (raw === "~") return os.homedir();
+  if (raw.startsWith("~/")) return path.join(os.homedir(), raw.slice(2));
+  return path.resolve(raw);
 }
 
-async function copyExtractedCli(sourceDir: string, targetDir: string) {
-  await fs.promises.rm(targetDir, { recursive: true, force: true });
-  await fs.promises.mkdir(path.dirname(targetDir), { recursive: true });
-  await fs.promises.cp(sourceDir, targetDir, { recursive: true });
+function runtimePaths(directory: string) {
+  return {
+    manifest: path.join(directory, ".prisma-migrate-runtime.json"),
+    nodeModules: path.join(directory, "node_modules"),
+    cliEntry: path.join(directory, "node_modules", "prisma", "build", "index.js"),
+    clientPackage: path.join(directory, "node_modules", "@prisma", "client", "package.json"),
+    enginesPackage: path.join(directory, "node_modules", "@prisma", "engines", "package.json"),
+    tsxEntry: path.join(directory, "node_modules", "tsx", "dist", "cli.mjs")
+  };
 }
 
-async function installRuntimeDependencies(packageDir: string) {
+function validateRuntimeFiles(directory: string) {
+  const paths = runtimePaths(directory);
+  return [paths.manifest, paths.cliEntry, paths.clientPackage, paths.enginesPackage, paths.tsxEntry].every(
+    (file) => fs.existsSync(file)
+  );
+}
+
+export async function loadPrismaRuntime(directory: string): Promise<PrismaRuntime> {
+  const absoluteDirectory = path.resolve(directory);
+  const paths = runtimePaths(absoluteDirectory);
+
+  if (!validateRuntimeFiles(absoluteDirectory)) {
+    throw new Error(`Prisma runtime is incomplete at ${absoluteDirectory}. Run mode=prepare first.`);
+  }
+
+  const manifest = JSON.parse(await fs.promises.readFile(paths.manifest, "utf8"));
+  if (manifest.revision !== RUNTIME_REVISION || !semver.valid(manifest.prismaVersion)) {
+    throw new Error(`Prisma runtime manifest is invalid at ${paths.manifest}.`);
+  }
+
+  return {
+    version: manifest.prismaVersion,
+    directory: absoluteDirectory,
+    cliEntry: paths.cliEntry
+  };
+}
+
+export async function ensurePrismaRuntime(versionInput: string): Promise<PrismaRuntime> {
+  const version = await resolvePrismaVersion(versionInput);
+  const directory = path.join(getCacheRoot(), `runtime-v${RUNTIME_REVISION}`, version);
+
+  if (validateRuntimeFiles(directory)) {
+    core.info(`Prisma runtime cache hit: ${version}`);
+    return loadPrismaRuntime(directory);
+  }
+
+  core.info(`Preparing Prisma runtime ${version}...`);
+  await fs.promises.rm(directory, { recursive: true, force: true });
+  await fs.promises.mkdir(directory, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(directory, "package.json"),
+    `${JSON.stringify(
+      {
+        name: "prisma-migrate-runtime",
+        private: true,
+        dependencies: { prisma: version, "@prisma/client": version, tsx: TSX_VERSION }
+      },
+      null,
+      2
+    )}\n`
+  );
+
   await exec.exec(
     "npm",
-    ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock"],
-    { cwd: packageDir }
+    ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock", "--prefer-offline"],
+    { cwd: directory }
   );
+
+  await fs.promises.writeFile(
+    runtimePaths(directory).manifest,
+    `${JSON.stringify({ revision: RUNTIME_REVISION, prismaVersion: version })}\n`
+  );
+
+  if (!validateRuntimeFiles(directory)) {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+    throw new Error(`Prisma runtime installation is incomplete for version ${version}.`);
+  }
+
+  return loadPrismaRuntime(directory);
+}
+
+export async function materializePrismaRuntime(runtime: PrismaRuntime, workingDirectory: string) {
+  const cwd = path.resolve(workingDirectory);
+  const target = path.join(cwd, "node_modules");
+  const source = runtimePaths(runtime.directory).nodeModules;
+  const current = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+
+  if (current) {
+    if (current.isSymbolicLink()) {
+      const resolvedTarget = await fs.promises.realpath(target);
+      const resolvedSource = await fs.promises.realpath(source);
+      if (resolvedTarget !== resolvedSource) {
+        throw new Error(`Refusing to replace existing node_modules symlink at ${target}.`);
+      }
+    } else {
+      core.info(`Using existing project dependencies at ${target}.`);
+    }
+    return;
+  }
+
+  await fs.promises.mkdir(cwd, { recursive: true });
+  await fs.promises.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
+  core.info(`Linked prepared Prisma runtime into ${target}.`);
 }
 
 export async function ensurePrismaCli(versionInput: string) {
-  const resolved = await resolvePrisma(versionInput);
-  const cacheRoot = getCacheRoot();
-  const packageCacheDir = path.join(cacheRoot, resolved.version, "package");
-  const rootCacheDir = path.join(cacheRoot, resolved.version);
-  const packageCachedCli = path.join(packageCacheDir, "build", "index.js");
-  const rootCachedCli = path.join(rootCacheDir, "build", "index.js");
-  const cachedEnginesPackage = path.join(
-    packageCacheDir,
-    "node_modules",
-    "@prisma",
-    "engines",
-    "package.json"
-  );
-
-  if (fs.existsSync(packageCachedCli) && fs.existsSync(cachedEnginesPackage)) {
-    core.info(`Prisma CLI cache hit: ${resolved.version}`);
-    core.addPath(path.dirname(packageCachedCli));
-    return packageCachedCli;
-  }
-
-  if (fs.existsSync(packageCachedCli) || fs.existsSync(rootCachedCli)) {
-    core.info(`Discarding incomplete Prisma CLI cache: ${resolved.version}`);
-    await fs.promises.rm(rootCacheDir, { recursive: true, force: true });
-  }
-
-  core.info(`Downloading Prisma CLI ${resolved.version}...`);
-  const tgz = await tc.downloadTool(resolved.tarball);
-  const extracted = await tc.extractTar(tgz);
-
-  const extractedPackageCli = path.join(extracted, "package", "build", "index.js");
-  const extractedRootCli = path.join(extracted, "build", "index.js");
-
-  let cachedCli = "";
-  if (fs.existsSync(extractedPackageCli)) {
-    await copyExtractedCli(path.join(extracted, "package"), packageCacheDir);
-    await installRuntimeDependencies(packageCacheDir);
-    cachedCli = packageCachedCli;
-  } else if (fs.existsSync(extractedRootCli)) {
-    throw new Error(`Unexpected Prisma CLI package layout at ${extracted}`);
-  } else {
-    throw new Error(`Prisma CLI entry not found in extracted tarball at ${extracted}`);
-  }
-
-  if (!fs.existsSync(cachedCli)) {
-    throw new Error(`Prisma CLI entry not found at ${cachedCli}`);
-  }
-
-  core.addPath(path.dirname(cachedCli));
-  return cachedCli;
+  return (await ensurePrismaRuntime(versionInput)).cliEntry;
 }

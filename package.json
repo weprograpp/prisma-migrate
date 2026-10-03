@@ -1,6 +1,6 @@
 {
   "name": "prisma-migrate",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A GitHub Action package for cached Prisma generate, migrate, and seed operations.",
   "keywords": [
     "actions",
@@ -24,12 +24,12 @@
   "author": "Prograpp <contacto@prograpp.com.mx>",
   "scripts": {
     "build": "ncc build src/index.ts -o dist --minify",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
     "@actions/exec": "^1.1.1",
-    "@actions/tool-cache": "^2.0.2",
     "semver": "^7.7.2"
   },
   "devDependencies": {
