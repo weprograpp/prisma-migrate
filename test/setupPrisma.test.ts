@@ -8,6 +8,7 @@ import {
   loadPrismaRuntime,
   materializePrismaRuntime,
   parseRuntimeDependencies,
+  processIdentityOwnsLock,
   resolveVersion,
   type PrismaRuntime
 } from "../src/setupPrisma";
@@ -36,6 +37,19 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
   });
   assert.throws(() => parseRuntimeDependencies('{"zod":"^3.25.0"}'), /exact semver/);
   assert.throws(() => parseRuntimeDependencies('{"prisma":"5.22.0"}'), /managed/);
+});
+
+test("processIdentityOwnsLock fails safe when identity lookup is unavailable", () => {
+  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }), true);
+  assert.equal(processIdentityOwnsLock("expected", { status: "missing" }), false);
+  assert.equal(
+    processIdentityOwnsLock("expected", { status: "found", value: "expected" }),
+    true
+  );
+  assert.equal(
+    processIdentityOwnsLock("expected", { status: "found", value: "recycled" }),
+    false
+  );
 });
 
 test("materializePrismaRuntime isolates generated clients by workspace", async () => {

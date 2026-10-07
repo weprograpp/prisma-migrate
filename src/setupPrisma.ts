@@ -13,7 +13,8 @@ const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
-const WORKSPACE_LOCK_OWNER_GRACE_MS = 30 * 1000;
+const WORKSPACE_LOCK_OWNER_GRACE_MS = 60 * 1000;
+const WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS = 10 * 1000;
 const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
 const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
 const execFileAsync = promisify(execFile);
@@ -273,6 +274,32 @@ type WorkspaceLockParticipant = {
   number?: number;
 };
 
+export type ProcessIdentityResult =
+  | { status: "found"; value: string }
+  | { status: "missing" }
+  | { status: "unknown" };
+
+export function processIdentityOwnsLock(
+  expectedIdentity: string,
+  currentIdentity: ProcessIdentityResult
+) {
+  return (
+    currentIdentity.status === "unknown" ||
+    (currentIdentity.status === "found" && currentIdentity.value === expectedIdentity)
+  );
+}
+
+function getMissingProcessResult(pid: number): ProcessIdentityResult {
+  try {
+    process.kill(pid, 0);
+    return { status: "unknown" };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
+      ? { status: "missing" }
+      : { status: "unknown" };
+  }
+}
+
 async function getProcessIdentity(pid: number) {
   try {
     if (process.platform === "linux") {
@@ -282,8 +309,11 @@ async function getProcessIdentity(pid: number) {
       ]);
       const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
       const startTime = fields[19];
-      if (!startTime) return undefined;
-      return `linux:${bootId.trim()}:${startTime}`;
+      if (!startTime) return { status: "unknown" } satisfies ProcessIdentityResult;
+      return {
+        status: "found",
+        value: `linux:${bootId.trim()}:${startTime}`
+      } satisfies ProcessIdentityResult;
     }
 
     if (process.platform === "win32") {
@@ -294,14 +324,21 @@ async function getProcessIdentity(pid: number) {
         `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`
       ]);
       const startTime = stdout.trim();
-      return startTime ? `win32:${startTime}` : undefined;
+      return startTime
+        ? ({ status: "found", value: `win32:${startTime}` } satisfies ProcessIdentityResult)
+        : ({ status: "unknown" } satisfies ProcessIdentityResult);
     }
 
     const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)]);
     const startTime = stdout.trim();
-    return startTime ? `${process.platform}:${startTime}` : undefined;
+    return startTime
+      ? ({
+          status: "found",
+          value: `${process.platform}:${startTime}`
+        } satisfies ProcessIdentityResult)
+      : ({ status: "unknown" } satisfies ProcessIdentityResult);
   } catch {
-    return undefined;
+    return getMissingProcessResult(pid);
   }
 }
 
@@ -331,7 +368,7 @@ async function readWorkspaceLockEntry(file: string) {
     ) {
       const currentIdentity = await getProcessIdentity(participant.pid);
       return {
-        active: currentIdentity === participant.processIdentity,
+        active: processIdentityOwnsLock(participant.processIdentity, currentIdentity),
         participant: participant as WorkspaceLockParticipant
       };
     }
@@ -341,6 +378,24 @@ async function readWorkspaceLockEntry(file: string) {
 
   return {
     active: Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS
+  };
+}
+
+function startCompatibilityHeartbeat(entryPath: string) {
+  let stopped = false;
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    void fs.promises.utimes(entryPath, now, now).catch((error: NodeJS.ErrnoException) => {
+      if (!stopped && error.code !== "ENOENT") {
+        core.warning(`Could not refresh Prisma workspace lock at ${entryPath}: ${error.message}`);
+      }
+    });
+  }, WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS);
+  heartbeat.unref();
+
+  return () => {
+    stopped = true;
+    clearInterval(heartbeat);
   };
 }
 
@@ -371,13 +426,19 @@ export async function acquireWorkspaceLock(lock: string) {
   await fs.promises.mkdir(lock, { recursive: true });
   const token = randomUUID();
   const processIdentity = await getProcessIdentity(process.pid);
-  if (!processIdentity) {
+  if (processIdentity.status !== "found") {
     throw new Error(`Could not determine process identity for Prisma workspace locking.`);
   }
-  const participant: WorkspaceLockParticipant = { pid: process.pid, token, processIdentity };
+  const participant: WorkspaceLockParticipant = {
+    pid: process.pid,
+    token,
+    processIdentity: processIdentity.value
+  };
   const choosingPath = path.join(lock, `${token}${WORKSPACE_LOCK_CHOOSING_SUFFIX}`);
   const ticketPath = path.join(lock, `${token}${WORKSPACE_LOCK_TICKET_SUFFIX}`);
   await writeWorkspaceLockEntry(choosingPath, participant);
+  let stopCompatibilityHeartbeat: (() => void) | undefined =
+    startCompatibilityHeartbeat(choosingPath);
 
   try {
     let existingTickets: Awaited<ReturnType<typeof listWorkspaceLockParticipants>>;
@@ -399,7 +460,9 @@ export async function acquireWorkspaceLock(lock: string) {
         )
       ) + 1;
     await writeWorkspaceLockEntry(ticketPath, participant);
+    stopCompatibilityHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
+    stopCompatibilityHeartbeat = startCompatibilityHeartbeat(ticketPath);
 
     while (true) {
       const choosing = await listWorkspaceLockParticipants(
@@ -424,13 +487,17 @@ export async function acquireWorkspaceLock(lock: string) {
           throw new Error(`Prisma workspace lock ticket disappeared at ${ticketPath}.`);
         }
         if (orderedTickets[0]?.token === token) {
-          return async () => fs.promises.rm(ticketPath, { force: true });
+          return async () => {
+            stopCompatibilityHeartbeat?.();
+            await fs.promises.rm(ticketPath, { force: true });
+          };
         }
       }
 
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   } catch (error) {
+    stopCompatibilityHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
     await fs.promises.rm(ticketPath, { force: true });
     throw error;
