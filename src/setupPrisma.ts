@@ -14,8 +14,10 @@ const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
-const WORKSPACE_LOCK_OWNER_GRACE_MS = 60 * 1000;
+export const WORKSPACE_LOCK_OWNER_GRACE_MS = 60 * 1000;
 const WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS = 10 * 1000;
+export const WORKSPACE_LOCK_RECOVERY_MS =
+  WORKSPACE_LOCK_OWNER_GRACE_MS + 2 * WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS;
 const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
 const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
 const execFileAsync = promisify(execFile);
@@ -285,13 +287,14 @@ export type WorkspaceLockOwnership = "active" | "abandoned" | "uncertain";
 export function classifyWorkspaceLockOwnership(
   expectedIdentity: string,
   currentIdentity: ProcessIdentityResult,
-  heartbeatIsFresh: boolean
+  heartbeatAgeMs: number
 ): WorkspaceLockOwnership {
   if (currentIdentity.status === "found") {
     return currentIdentity.value === expectedIdentity ? "active" : "abandoned";
   }
   if (currentIdentity.status === "missing") return "abandoned";
-  return heartbeatIsFresh ? "active" : "uncertain";
+  if (heartbeatAgeMs < WORKSPACE_LOCK_OWNER_GRACE_MS) return "active";
+  return heartbeatAgeMs >= WORKSPACE_LOCK_RECOVERY_MS ? "abandoned" : "uncertain";
 }
 
 function getMissingProcessResult(pid: number): ProcessIdentityResult {
@@ -360,7 +363,8 @@ async function writeWorkspaceLockEntry(file: string, participant: WorkspaceLockP
 async function readWorkspaceLockEntry(file: string) {
   const entryStat = await fs.promises.stat(file).catch(() => undefined);
   if (!entryStat) return { active: false, missing: true };
-  const heartbeatIsFresh = Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS;
+  const heartbeatAgeMs = Date.now() - entryStat.mtimeMs;
+  const heartbeatIsFresh = heartbeatAgeMs < WORKSPACE_LOCK_OWNER_GRACE_MS;
 
   try {
     const participant = JSON.parse(
@@ -376,7 +380,7 @@ async function readWorkspaceLockEntry(file: string) {
       const ownership = classifyWorkspaceLockOwnership(
         participant.processIdentity,
         currentIdentity,
-        heartbeatIsFresh
+        heartbeatAgeMs
       );
       return {
         active: ownership === "active",
@@ -456,9 +460,10 @@ async function listWorkspaceLockParticipants(lock: string, suffix: string) {
     const file = path.join(lock, name);
     const state = await readWorkspaceLockEntry(file);
     if (state.uncertain) {
-      throw new Error(
-        `Cannot safely verify Prisma workspace lock ownership at ${file}; refusing to remove it.`
-      );
+      // Keep waiting through the recovery window. A persistently stale heartbeat
+      // becomes abandoned after WORKSPACE_LOCK_RECOVERY_MS, avoiding both an
+      // unsafe one-read cleanup and a permanently wedged workspace.
+      hasUnknownActiveEntry = true;
     } else if (!state.active) {
       await fs.promises.rm(file, { force: true });
       if (!state.missing) core.warning(`Recovered abandoned Prisma workspace lock entry at ${file}.`);

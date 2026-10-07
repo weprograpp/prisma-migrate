@@ -11,6 +11,8 @@ import {
   parseRuntimeDependencies,
   resolveVersion,
   startCompatibilityHeartbeat,
+  WORKSPACE_LOCK_OWNER_GRACE_MS,
+  WORKSPACE_LOCK_RECOVERY_MS,
   type PrismaRuntime
 } from "../src/setupPrisma";
 
@@ -42,22 +44,34 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
 
 test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavailable", () => {
   assert.equal(
-    classifyWorkspaceLockOwnership("expected", { status: "unknown" }, true),
+    classifyWorkspaceLockOwnership("expected", { status: "unknown" }, 0),
     "active"
   );
   assert.equal(
-    classifyWorkspaceLockOwnership("expected", { status: "unknown" }, false),
+    classifyWorkspaceLockOwnership(
+      "expected",
+      { status: "unknown" },
+      WORKSPACE_LOCK_OWNER_GRACE_MS
+    ),
     "uncertain"
   );
   assert.equal(
-    classifyWorkspaceLockOwnership("expected", { status: "missing" }, true),
+    classifyWorkspaceLockOwnership(
+      "expected",
+      { status: "unknown" },
+      WORKSPACE_LOCK_RECOVERY_MS
+    ),
+    "abandoned"
+  );
+  assert.equal(
+    classifyWorkspaceLockOwnership("expected", { status: "missing" }, 0),
     "abandoned"
   );
   assert.equal(
     classifyWorkspaceLockOwnership(
       "expected",
       { status: "found", value: "expected" },
-      false
+      WORKSPACE_LOCK_RECOVERY_MS
     ),
     "active"
   );
@@ -65,7 +79,7 @@ test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavaila
     classifyWorkspaceLockOwnership(
       "expected",
       { status: "found", value: "recycled" },
-      true
+      0
     ),
     "abandoned"
   );
