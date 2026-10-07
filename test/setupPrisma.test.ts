@@ -75,6 +75,24 @@ test("compatibility heartbeat continues while the main event loop is blocked", a
   }
 });
 
+test("compatibility heartbeat reports a compromised lease", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-lock-compromised-"));
+  const entry = path.join(root, "missing.ticket.json");
+  let stopHeartbeat: (() => void) | undefined;
+
+  try {
+    const compromised = new Promise<Error>((resolve) => {
+      stopHeartbeat = startCompatibilityHeartbeat(entry, 10, resolve);
+    });
+    const error = await compromised;
+    assert.match(error.message, /heartbeat failed/);
+    assert.match(error.message, /ENOENT/);
+  } finally {
+    stopHeartbeat?.();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("materializePrismaRuntime isolates generated clients by workspace", async () => {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-link-"));
   const runtimeDirectory = path.join(root, "runtime");

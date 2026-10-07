@@ -390,16 +390,28 @@ async function readWorkspaceLockEntry(file: string) {
 
 export function startCompatibilityHeartbeat(
   entryPath: string,
-  interval = WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS
+  interval = WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS,
+  onCompromised: (error: Error) => void = (error) => {
+    core.setFailed(error.message);
+    process.exit(1);
+  }
 ) {
   let stopped = false;
   const heartbeat = new Worker(
     `
       const fs = require("node:fs");
-      const { workerData } = require("node:worker_threads");
+      const { parentPort, workerData } = require("node:worker_threads");
       setInterval(() => {
         const now = new Date();
-        fs.utimes(workerData.entryPath, now, now, () => {});
+        fs.utimes(workerData.entryPath, now, now, (error) => {
+          if (error) {
+            parentPort.postMessage({
+              type: "compromised",
+              message: error.message,
+              code: error.code
+            });
+          }
+        });
       }, workerData.interval);
     `,
     {
@@ -407,9 +419,20 @@ export function startCompatibilityHeartbeat(
       workerData: { entryPath, interval }
     }
   );
+  heartbeat.on("message", (message: { type?: string; message?: string; code?: string }) => {
+    if (!stopped && message.type === "compromised") {
+      onCompromised(
+        new Error(
+          `Prisma workspace lock heartbeat failed at ${entryPath}: ${message.code ?? "UNKNOWN"} ${message.message ?? "unknown error"}`
+        )
+      );
+    }
+  });
   heartbeat.on("error", (error) => {
     if (!stopped) {
-      core.warning(`Prisma workspace lock heartbeat failed at ${entryPath}: ${error.message}`);
+      onCompromised(
+        new Error(`Prisma workspace lock heartbeat worker failed at ${entryPath}: ${error.message}`)
+      );
     }
   });
   heartbeat.unref();
