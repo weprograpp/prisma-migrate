@@ -4,7 +4,8 @@ import * as path from "node:path";
 import {
   ensurePrismaRuntime,
   loadPrismaRuntime,
-  materializePrismaRuntime
+  materializePrismaRuntime,
+  parseRuntimeDependencies
 } from "./setupPrisma";
 
 type PrismaOperation = "generate" | "migrate" | "seed";
@@ -111,6 +112,7 @@ async function run() {
     const mode = (getInput("mode") || "execute") as Mode;
     const prismaVersion = getInput("prisma-version") || "5.22.0";
     const runtimeDirectory = getInput("runtime-directory");
+    const runtimeDependencies = parseRuntimeDependencies(getInput("runtime-dependencies"));
     const schema = getInput("schema") || "prisma/schema.prisma";
     const cwd = path.resolve(getInput("working-directory") || ".");
     const prismaArgs = getInput("prisma-args") || "";
@@ -131,7 +133,7 @@ async function run() {
     const runtime = runtimeDirectory
       ? await loadPrismaRuntime(runtimeDirectory)
       : await ensurePrismaRuntime(prismaVersion);
-    await materializePrismaRuntime(runtime, cwd);
+    await materializePrismaRuntime(runtime, cwd, runtimeDependencies);
     core.setOutput("runtime-directory", runtime.directory);
     core.setOutput("setup-ms", Date.now() - setupStarted);
 

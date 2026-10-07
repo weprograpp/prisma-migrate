@@ -21,6 +21,10 @@ inputs:
   runtime-directory:
     description: "Prepared runtime directory returned by a previous mode=prepare invocation"
     required: false
+  runtime-dependencies:
+    description: "JSON object of additional seed/runtime packages pinned to exact versions"
+    required: false
+    default: "{}"
   schema:
     description: "Path to schema.prisma"
     required: false
@@ -66,6 +70,11 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
     - name: Resolve Prisma version
       id: resolve-prisma
       if: inputs.runtime-directory == ''
@@ -86,15 +95,9 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/prisma-migrate
-        key: prisma-migrate-runtime-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
+        key: prisma-migrate-runtime-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.resolve-prisma.outputs.resolved_prisma_version }}
         restore-keys: |
-          prisma-migrate-runtime-v2-${{ runner.os }}-${{ runner.arch }}-
-
-    - name: Setup Node.js
-      if: inputs.runtime-directory == ''
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20
+          prisma-migrate-runtime-v3-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Run Prisma operations
       id: prisma
@@ -104,6 +107,7 @@ runs:
         INPUT_PRISMA_VERSION: ${{ inputs.prisma-version }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_RUNTIME_DIRECTORY: ${{ inputs.runtime-directory }}
+        INPUT_RUNTIME_DEPENDENCIES: ${{ inputs.runtime-dependencies }}
         INPUT_SCHEMA: ${{ inputs.schema }}
         INPUT_DATABASE_URL: ${{ inputs.database-url }}
         INPUT_DATABASE_URLS: ${{ inputs.database-urls }}

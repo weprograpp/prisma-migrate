@@ -1,12 +1,13 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import semver from "semver";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const RUNTIME_REVISION = "2";
+const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 
 type NpmMeta = {
@@ -19,6 +20,8 @@ export type PrismaRuntime = {
   directory: string;
   cliEntry: string;
 };
+
+export type RuntimeDependencies = Record<string, string>;
 
 function fetchJson<T = unknown>(url: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -73,6 +76,40 @@ export function getCacheRoot() {
   if (raw === "~") return os.homedir();
   if (raw.startsWith("~/")) return path.join(os.homedir(), raw.slice(2));
   return path.resolve(raw);
+}
+
+export function parseRuntimeDependencies(raw: string): RuntimeDependencies {
+  if (!raw.trim()) return {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("runtime-dependencies must be a JSON object of package names to exact versions.");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("runtime-dependencies must be a JSON object of package names to exact versions.");
+  }
+
+  const dependencies = Object.entries(parsed as Record<string, unknown>).sort(([left], [right]) =>
+    left.localeCompare(right)
+  );
+  const packageNamePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+
+  for (const [name, version] of dependencies) {
+    if (!packageNamePattern.test(name)) {
+      throw new Error(`Invalid runtime dependency package name: ${name}`);
+    }
+    if (name === "prisma" || name === "@prisma/client" || name === "tsx") {
+      throw new Error(`${name} is managed by prisma-migrate and must not be overridden.`);
+    }
+    if (typeof version !== "string" || !semver.valid(version)) {
+      throw new Error(`runtime-dependencies must pin an exact semver version for ${name}.`);
+    }
+  }
+
+  return Object.fromEntries(dependencies) as RuntimeDependencies;
 }
 
 function runtimePaths(directory: string) {
@@ -157,10 +194,46 @@ export async function ensurePrismaRuntime(versionInput: string): Promise<PrismaR
   return loadPrismaRuntime(directory);
 }
 
-export async function materializePrismaRuntime(runtime: PrismaRuntime, workingDirectory: string) {
+function dependencyPackagePath(nodeModules: string, packageName: string) {
+  return path.join(nodeModules, ...packageName.split("/"), "package.json");
+}
+
+function getWorkspaceRuntimeRoot(
+  cwd: string,
+  runtime: PrismaRuntime,
+  runtimeDependencies: RuntimeDependencies
+) {
+  const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ cwd, runtime: runtime.directory, runtimeDependencies }))
+    .digest("hex")
+    .slice(0, 20);
+  return path.join(base, "prisma-migrate-workspaces", fingerprint);
+}
+
+async function assertExistingDependencies(
+  nodeModules: string,
+  runtimeDependencies: RuntimeDependencies
+) {
+  for (const packageName of Object.keys(runtimeDependencies)) {
+    if (!fs.existsSync(dependencyPackagePath(nodeModules, packageName))) {
+      throw new Error(
+        `Existing project dependencies do not contain ${packageName}. Install it before running the action.`
+      );
+    }
+  }
+}
+
+export async function materializePrismaRuntime(
+  runtime: PrismaRuntime,
+  workingDirectory: string,
+  runtimeDependencies: RuntimeDependencies = {}
+) {
   const cwd = path.resolve(workingDirectory);
   const target = path.join(cwd, "node_modules");
   const source = runtimePaths(runtime.directory).nodeModules;
+  const workspaceRuntimeRoot = getWorkspaceRuntimeRoot(cwd, runtime, runtimeDependencies);
+  const workspaceNodeModules = path.join(workspaceRuntimeRoot, "node_modules");
   const current = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
     throw error;
@@ -169,19 +242,58 @@ export async function materializePrismaRuntime(runtime: PrismaRuntime, workingDi
   if (current) {
     if (current.isSymbolicLink()) {
       const resolvedTarget = await fs.promises.realpath(target);
-      const resolvedSource = await fs.promises.realpath(source);
-      if (resolvedTarget !== resolvedSource) {
+      const resolvedWorkspace = await fs.promises.realpath(workspaceNodeModules).catch(() => "");
+      if (resolvedTarget !== resolvedWorkspace) {
         throw new Error(`Refusing to replace existing node_modules symlink at ${target}.`);
       }
     } else {
+      await assertExistingDependencies(target, runtimeDependencies);
       core.info(`Using existing project dependencies at ${target}.`);
     }
     return;
   }
 
   await fs.promises.mkdir(cwd, { recursive: true });
-  await fs.promises.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
-  core.info(`Linked prepared Prisma runtime into ${target}.`);
+  await fs.promises.rm(workspaceRuntimeRoot, { recursive: true, force: true });
+  await fs.promises.mkdir(workspaceRuntimeRoot, { recursive: true });
+  await fs.promises.cp(source, workspaceNodeModules, { recursive: true });
+  await fs.promises.rm(path.join(workspaceNodeModules, ".prisma"), {
+    recursive: true,
+    force: true
+  });
+  await fs.promises.writeFile(
+    path.join(workspaceRuntimeRoot, "package.json"),
+    `${JSON.stringify(
+      {
+        name: "prisma-migrate-workspace-runtime",
+        private: true,
+        dependencies: {
+          prisma: runtime.version,
+          "@prisma/client": runtime.version,
+          tsx: TSX_VERSION,
+          ...runtimeDependencies
+        }
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  if (Object.keys(runtimeDependencies).length > 0) {
+    core.info(`Installing ${Object.keys(runtimeDependencies).length} additional runtime dependencies...`);
+    await exec.exec(
+      "npm",
+      ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock", "--prefer-offline"],
+      { cwd: workspaceRuntimeRoot }
+    );
+  }
+
+  await fs.promises.symlink(
+    workspaceNodeModules,
+    target,
+    process.platform === "win32" ? "junction" : "dir"
+  );
+  core.info(`Materialized isolated Prisma runtime into ${target}.`);
 }
 
 export async function ensurePrismaCli(versionInput: string) {

@@ -1,6 +1,6 @@
 # Prisma Operations GitHub Action
 
-Reusable GitHub Action for cached Prisma execution. It prepares the Prisma CLI, client, engines, and `tsx`, then runs `generate`, `migrate deploy`, and/or `db seed` without requiring callers to run `npm ci` or `npx prisma`.
+Reusable GitHub Action for cached Prisma execution. It prepares the Prisma CLI, client, engines, and `tsx`, then runs `generate`, `migrate deploy`, and/or `db seed` without requiring a full project `npm ci`. Seeds with other runtime imports must declare them through `runtime-dependencies` or use an existing project `node_modules`.
 
 ## What it does
 
@@ -18,6 +18,7 @@ Reusable GitHub Action for cached Prisma execution. It prepares the Prisma CLI, 
 | `prisma-version` | Prisma CLI version, tag, or semver range | `5.22.0` |
 | `working-directory` | Working directory for the Prisma project | `.` |
 | `runtime-directory` | Runtime returned by a previous `prepare` step | _empty_ |
+| `runtime-dependencies` | JSON object of additional runtime packages pinned to exact versions | `{}` |
 | `schema` | Path to `schema.prisma` | `prisma/schema.prisma` |
 | `database-url` | Single `DATABASE_URL` | _empty_ |
 | `database-urls` | One or more `DATABASE_URL` values | _empty_ |
@@ -74,6 +75,7 @@ Start the infrastructure build first, then prepare Prisma before waiting for the
     mode: prepare
     prisma-version: "5.22.0"
     working-directory: "tavaro"
+    runtime-dependencies: '{"zod":"3.25.1"}'
 
 - name: Wait for database infrastructure
   run: ./wait-for-infrastructure.sh
@@ -84,6 +86,7 @@ Start the infrastructure build first, then prepare Prisma before waiting for the
     mode: execute
     runtime-directory: ${{ steps.prisma-prepare.outputs.runtime-directory }}
     working-directory: "tavaro"
+    runtime-dependencies: '{"zod":"3.25.1"}'
     database-url: ${{ secrets.DATABASE_CONNECTION_STRING }}
     generate: "true"
     migrate: "true"
@@ -98,7 +101,10 @@ If your schema uses `env("DATABASE_URL")`, pass a database URL even for `generat
 - `prisma-args` is passed to `prisma migrate deploy` only.
 - If multiple database URLs are provided, `generate` uses the first one to satisfy schemas that rely on `DATABASE_URL`.
 - The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`; the cache key is scoped by OS, architecture, runtime revision, and Prisma version.
-- The prepared runtime is linked into the working directory only when it does not already have `node_modules`. Existing project dependencies are never replaced.
+- Each dependency-free project gets an isolated copy of the prepared runtime, so generated Prisma clients never write into the shared cache or another workspace.
+- `runtime-dependencies` accepts package names mapped to exact semantic versions. Pass the same value to `prepare` and `execute` so those packages can be installed during the parallel preparation phase.
+- Existing project dependencies are never replaced. When `node_modules` already exists, every declared runtime dependency must already be installed there.
+- Node.js 20 is configured for both `prepare` and `execute` invocations.
 - Set `PRISMA_MIGRATE_CACHE_DIR` if you want to store the downloaded Prisma versions in a custom cache location.
 
 ## Build
