@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   acquireWorkspaceLock,
   classifyWorkspaceLockOwnership,
-  getWorkspaceLockName,
+  getWorkspaceExecutionScope,
   loadPrismaRuntime,
   materializePrismaRuntime,
   parseRuntimeDependencies,
@@ -42,21 +42,38 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
   assert.throws(() => parseRuntimeDependencies('{"prisma":"5.22.0"}'), /managed/);
 });
 
-test("getWorkspaceLockName isolates GitHub workflow attempts", () => {
-  const firstAttempt = getWorkspaceLockName({
+test("getWorkspaceExecutionScope isolates GitHub jobs and workflow attempts", () => {
+  const firstAttempt = getWorkspaceExecutionScope({
     GITHUB_RUN_ID: "1234",
-    GITHUB_RUN_ATTEMPT: "1"
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_JOB: "create-tenant"
   });
   assert.equal(
     firstAttempt,
-    getWorkspaceLockName({ GITHUB_RUN_ID: "1234", GITHUB_RUN_ATTEMPT: "1" })
+    getWorkspaceExecutionScope({
+      GITHUB_RUN_ID: "1234",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_JOB: "create-tenant"
+    })
   );
   assert.notEqual(
     firstAttempt,
-    getWorkspaceLockName({ GITHUB_RUN_ID: "1234", GITHUB_RUN_ATTEMPT: "2" })
+    getWorkspaceExecutionScope({
+      GITHUB_RUN_ID: "1234",
+      GITHUB_RUN_ATTEMPT: "2",
+      GITHUB_JOB: "create-tenant"
+    })
   );
-  assert.notEqual(firstAttempt, getWorkspaceLockName({ GITHUB_RUN_ID: "5678" }));
-  assert.equal(getWorkspaceLockName({}), ".materialize.lock");
+  assert.notEqual(
+    firstAttempt,
+    getWorkspaceExecutionScope({
+      GITHUB_RUN_ID: "1234",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_JOB: "another-job"
+    })
+  );
+  assert.notEqual(firstAttempt, getWorkspaceExecutionScope({ GITHUB_RUN_ID: "5678" }));
+  assert.equal(getWorkspaceExecutionScope({}), undefined);
 });
 
 test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavailable", () => {

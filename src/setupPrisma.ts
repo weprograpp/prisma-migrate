@@ -215,23 +215,26 @@ type WorkspaceRuntimeDescriptor = {
   runtimeDependencies: RuntimeDependencies;
 };
 
-function getWorkspaceBase() {
-  const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
-  return path.join(base, "prisma-migrate-workspaces");
-}
-
-export function getWorkspaceLockName(
+export function getWorkspaceExecutionScope(
   environment: Record<string, string | undefined> = process.env
 ) {
   const runId = environment.GITHUB_RUN_ID?.trim();
-  if (!runId) return ".materialize.lock";
+  if (!runId) return undefined;
 
   const runAttempt = environment.GITHUB_RUN_ATTEMPT?.trim() || "1";
-  const executionFingerprint = createHash("sha256")
-    .update(`${runId}:${runAttempt}`)
+  const job = environment.GITHUB_JOB?.trim() || "job";
+  return createHash("sha256")
+    .update(`${runId}:${runAttempt}:${job}`)
     .digest("hex")
     .slice(0, 20);
-  return `.materialize-${executionFingerprint}.lock`;
+}
+
+function getWorkspaceBase() {
+  const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
+  const executionScope = getWorkspaceExecutionScope();
+  return executionScope
+    ? path.join(base, "prisma-migrate-workspaces", executionScope)
+    : path.join(base, "prisma-migrate-workspaces");
 }
 
 function normalizeRuntimeDependencies(runtimeDependencies: RuntimeDependencies) {
@@ -268,7 +271,7 @@ function getWorkspaceRuntimePaths(
     runtimeRoot,
     nodeModules: path.join(runtimeRoot, "node_modules"),
     manifest: path.join(runtimeRoot, WORKSPACE_RUNTIME_MANIFEST),
-    lock: path.join(projectRoot, getWorkspaceLockName())
+    lock: path.join(projectRoot, ".materialize.lock")
   };
 }
 
