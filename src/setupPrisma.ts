@@ -16,8 +16,6 @@ const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
 export const WORKSPACE_LOCK_OWNER_GRACE_MS = 60 * 1000;
 const WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS = 10 * 1000;
-export const WORKSPACE_LOCK_RECOVERY_MS =
-  WORKSPACE_LOCK_OWNER_GRACE_MS + 2 * WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS;
 const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
 const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
 const execFileAsync = promisify(execFile);
@@ -222,6 +220,20 @@ function getWorkspaceBase() {
   return path.join(base, "prisma-migrate-workspaces");
 }
 
+export function getWorkspaceLockName(
+  environment: Record<string, string | undefined> = process.env
+) {
+  const runId = environment.GITHUB_RUN_ID?.trim();
+  if (!runId) return ".materialize.lock";
+
+  const runAttempt = environment.GITHUB_RUN_ATTEMPT?.trim() || "1";
+  const executionFingerprint = createHash("sha256")
+    .update(`${runId}:${runAttempt}`)
+    .digest("hex")
+    .slice(0, 20);
+  return `.materialize-${executionFingerprint}.lock`;
+}
+
 function normalizeRuntimeDependencies(runtimeDependencies: RuntimeDependencies) {
   return Object.fromEntries(
     Object.entries(runtimeDependencies).sort(([left], [right]) => left.localeCompare(right))
@@ -256,7 +268,7 @@ function getWorkspaceRuntimePaths(
     runtimeRoot,
     nodeModules: path.join(runtimeRoot, "node_modules"),
     manifest: path.join(runtimeRoot, WORKSPACE_RUNTIME_MANIFEST),
-    lock: path.join(projectRoot, ".materialize.lock")
+    lock: path.join(projectRoot, getWorkspaceLockName())
   };
 }
 
@@ -294,7 +306,7 @@ export function classifyWorkspaceLockOwnership(
   }
   if (currentIdentity.status === "missing") return "abandoned";
   if (heartbeatAgeMs < WORKSPACE_LOCK_OWNER_GRACE_MS) return "active";
-  return heartbeatAgeMs >= WORKSPACE_LOCK_RECOVERY_MS ? "abandoned" : "uncertain";
+  return "uncertain";
 }
 
 function getMissingProcessResult(pid: number): ProcessIdentityResult {
@@ -460,10 +472,9 @@ async function listWorkspaceLockParticipants(lock: string, suffix: string) {
     const file = path.join(lock, name);
     const state = await readWorkspaceLockEntry(file);
     if (state.uncertain) {
-      // Keep waiting through the recovery window. A persistently stale heartbeat
-      // becomes abandoned after WORKSPACE_LOCK_RECOVERY_MS, avoiding both an
-      // unsafe one-read cleanup and a permanently wedged workspace.
-      hasUnknownActiveEntry = true;
+      throw new Error(
+        `Cannot safely verify Prisma workspace lock ownership at ${file}; refusing to remove it. Rerun the GitHub workflow to use a fresh execution-scoped lock.`
+      );
     } else if (!state.active) {
       await fs.promises.rm(file, { force: true });
       if (!state.missing) core.warning(`Recovered abandoned Prisma workspace lock entry at ${file}.`);

@@ -6,13 +6,13 @@ import test from "node:test";
 import {
   acquireWorkspaceLock,
   classifyWorkspaceLockOwnership,
+  getWorkspaceLockName,
   loadPrismaRuntime,
   materializePrismaRuntime,
   parseRuntimeDependencies,
   resolveVersion,
   startCompatibilityHeartbeat,
   WORKSPACE_LOCK_OWNER_GRACE_MS,
-  WORKSPACE_LOCK_RECOVERY_MS,
   type PrismaRuntime
 } from "../src/setupPrisma";
 
@@ -42,6 +42,23 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
   assert.throws(() => parseRuntimeDependencies('{"prisma":"5.22.0"}'), /managed/);
 });
 
+test("getWorkspaceLockName isolates GitHub workflow attempts", () => {
+  const firstAttempt = getWorkspaceLockName({
+    GITHUB_RUN_ID: "1234",
+    GITHUB_RUN_ATTEMPT: "1"
+  });
+  assert.equal(
+    firstAttempt,
+    getWorkspaceLockName({ GITHUB_RUN_ID: "1234", GITHUB_RUN_ATTEMPT: "1" })
+  );
+  assert.notEqual(
+    firstAttempt,
+    getWorkspaceLockName({ GITHUB_RUN_ID: "1234", GITHUB_RUN_ATTEMPT: "2" })
+  );
+  assert.notEqual(firstAttempt, getWorkspaceLockName({ GITHUB_RUN_ID: "5678" }));
+  assert.equal(getWorkspaceLockName({}), ".materialize.lock");
+});
+
 test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavailable", () => {
   assert.equal(
     classifyWorkspaceLockOwnership("expected", { status: "unknown" }, 0),
@@ -59,9 +76,9 @@ test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavaila
     classifyWorkspaceLockOwnership(
       "expected",
       { status: "unknown" },
-      WORKSPACE_LOCK_RECOVERY_MS
+      WORKSPACE_LOCK_OWNER_GRACE_MS * 10
     ),
-    "abandoned"
+    "uncertain"
   );
   assert.equal(
     classifyWorkspaceLockOwnership("expected", { status: "missing" }, 0),
@@ -71,7 +88,7 @@ test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavaila
     classifyWorkspaceLockOwnership(
       "expected",
       { status: "found", value: "expected" },
-      WORKSPACE_LOCK_RECOVERY_MS
+      WORKSPACE_LOCK_OWNER_GRACE_MS * 10
     ),
     "active"
   );
