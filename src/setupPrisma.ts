@@ -1,20 +1,22 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import semver from "semver";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
-const WORKSPACE_LOCK_STALE_MS = 60 * 1000;
-const WORKSPACE_LOCK_HEARTBEAT_MS = 10 * 1000;
+const WORKSPACE_LOCK_OWNER_GRACE_MS = 30 * 1000;
 const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
 const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
+const execFileAsync = promisify(execFile);
 
 type NpmMeta = {
   "dist-tags": Record<string, string>;
@@ -267,15 +269,39 @@ function isPathInside(parent: string, child: string) {
 type WorkspaceLockParticipant = {
   pid: number;
   token: string;
+  processIdentity: string;
   number?: number;
 };
 
-function isProcessAlive(pid: number) {
+async function getProcessIdentity(pid: number) {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    if (process.platform === "linux") {
+      const [stat, bootId] = await Promise.all([
+        fs.promises.readFile(`/proc/${pid}/stat`, "utf8"),
+        fs.promises.readFile("/proc/sys/kernel/random/boot_id", "utf8")
+      ]);
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      const startTime = fields[19];
+      if (!startTime) return undefined;
+      return `linux:${bootId.trim()}:${startTime}`;
+    }
+
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`
+      ]);
+      const startTime = stdout.trim();
+      return startTime ? `win32:${startTime}` : undefined;
+    }
+
+    const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const startTime = stdout.trim();
+    return startTime ? `${process.platform}:${startTime}` : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -292,7 +318,6 @@ async function writeWorkspaceLockEntry(file: string, participant: WorkspaceLockP
 async function readWorkspaceLockEntry(file: string) {
   const entryStat = await fs.promises.stat(file).catch(() => undefined);
   if (!entryStat) return { active: false, missing: true };
-  const heartbeatIsFresh = Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_STALE_MS;
 
   try {
     const participant = JSON.parse(
@@ -301,10 +326,12 @@ async function readWorkspaceLockEntry(file: string) {
     if (
       typeof participant.pid === "number" &&
       participant.pid > 0 &&
-      typeof participant.token === "string"
+      typeof participant.token === "string" &&
+      typeof participant.processIdentity === "string"
     ) {
+      const currentIdentity = await getProcessIdentity(participant.pid);
       return {
-        active: heartbeatIsFresh && isProcessAlive(participant.pid),
+        active: currentIdentity === participant.processIdentity,
         participant: participant as WorkspaceLockParticipant
       };
     }
@@ -312,24 +339,8 @@ async function readWorkspaceLockEntry(file: string) {
     // A participant can disappear while its owner releases the lock.
   }
 
-  return { active: heartbeatIsFresh };
-}
-
-function startWorkspaceLockHeartbeat(ticketPath: string) {
-  let stopped = false;
-  const heartbeat = setInterval(() => {
-    const now = new Date();
-    void fs.promises.utimes(ticketPath, now, now).catch((error: NodeJS.ErrnoException) => {
-      if (!stopped && error.code !== "ENOENT") {
-        core.warning(`Could not refresh Prisma workspace lock at ${ticketPath}: ${error.message}`);
-      }
-    });
-  }, WORKSPACE_LOCK_HEARTBEAT_MS);
-  heartbeat.unref();
-
-  return () => {
-    stopped = true;
-    clearInterval(heartbeat);
+  return {
+    active: Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS
   };
 }
 
@@ -359,11 +370,14 @@ export async function acquireWorkspaceLock(lock: string) {
   // abandoned-entry cleanup safe because a recovered path is never reused by a new owner.
   await fs.promises.mkdir(lock, { recursive: true });
   const token = randomUUID();
-  const participant: WorkspaceLockParticipant = { pid: process.pid, token };
+  const processIdentity = await getProcessIdentity(process.pid);
+  if (!processIdentity) {
+    throw new Error(`Could not determine process identity for Prisma workspace locking.`);
+  }
+  const participant: WorkspaceLockParticipant = { pid: process.pid, token, processIdentity };
   const choosingPath = path.join(lock, `${token}${WORKSPACE_LOCK_CHOOSING_SUFFIX}`);
   const ticketPath = path.join(lock, `${token}${WORKSPACE_LOCK_TICKET_SUFFIX}`);
   await writeWorkspaceLockEntry(choosingPath, participant);
-  let stopHeartbeat: (() => void) | undefined = startWorkspaceLockHeartbeat(choosingPath);
 
   try {
     let existingTickets: Awaited<ReturnType<typeof listWorkspaceLockParticipants>>;
@@ -385,9 +399,7 @@ export async function acquireWorkspaceLock(lock: string) {
         )
       ) + 1;
     await writeWorkspaceLockEntry(ticketPath, participant);
-    stopHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
-    stopHeartbeat = startWorkspaceLockHeartbeat(ticketPath);
 
     while (true) {
       const choosing = await listWorkspaceLockParticipants(
@@ -412,17 +424,13 @@ export async function acquireWorkspaceLock(lock: string) {
           throw new Error(`Prisma workspace lock ticket disappeared at ${ticketPath}.`);
         }
         if (orderedTickets[0]?.token === token) {
-          return async () => {
-            stopHeartbeat?.();
-            await fs.promises.rm(ticketPath, { force: true });
-          };
+          return async () => fs.promises.rm(ticketPath, { force: true });
         }
       }
 
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   } catch (error) {
-    stopHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
     await fs.promises.rm(ticketPath, { force: true });
     throw error;

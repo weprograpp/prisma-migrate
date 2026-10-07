@@ -206,6 +206,7 @@ test("acquireWorkspaceLock safely serializes contenders after abandoned entries"
   const abandoned = JSON.stringify({
     pid: 99_999_999,
     token: "abandoned",
+    processIdentity: "terminated-process",
     number: 1
   });
   const abandonedChoosing = path.join(lock, "abandoned.choosing.json");
@@ -215,10 +216,13 @@ test("acquireWorkspaceLock safely serializes contenders after abandoned entries"
   await fs.promises.writeFile(abandonedTicket, `${abandoned}\n`);
   await fs.promises.writeFile(
     recycledPidTicket,
-    `${JSON.stringify({ pid: process.pid, token: "recycled-pid", number: 1 })}\n`
+    `${JSON.stringify({
+      pid: process.pid,
+      token: "recycled-pid",
+      processIdentity: "previous-process-with-same-pid",
+      number: 1
+    })}\n`
   );
-  const staleTime = new Date(Date.now() - 2 * 60_000);
-  await fs.promises.utimes(recycledPidTicket, staleTime, staleTime);
 
   try {
     let acquiredCount = 0;
