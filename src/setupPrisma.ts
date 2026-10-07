@@ -8,6 +8,7 @@ import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 
 const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
@@ -281,10 +282,11 @@ export type ProcessIdentityResult =
 
 export function processIdentityOwnsLock(
   expectedIdentity: string,
-  currentIdentity: ProcessIdentityResult
+  currentIdentity: ProcessIdentityResult,
+  heartbeatIsFresh: boolean
 ) {
   return (
-    currentIdentity.status === "unknown" ||
+    (currentIdentity.status === "unknown" && heartbeatIsFresh) ||
     (currentIdentity.status === "found" && currentIdentity.value === expectedIdentity)
   );
 }
@@ -355,6 +357,7 @@ async function writeWorkspaceLockEntry(file: string, participant: WorkspaceLockP
 async function readWorkspaceLockEntry(file: string) {
   const entryStat = await fs.promises.stat(file).catch(() => undefined);
   if (!entryStat) return { active: false, missing: true };
+  const heartbeatIsFresh = Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS;
 
   try {
     const participant = JSON.parse(
@@ -368,7 +371,11 @@ async function readWorkspaceLockEntry(file: string) {
     ) {
       const currentIdentity = await getProcessIdentity(participant.pid);
       return {
-        active: processIdentityOwnsLock(participant.processIdentity, currentIdentity),
+        active: processIdentityOwnsLock(
+          participant.processIdentity,
+          currentIdentity,
+          heartbeatIsFresh
+        ),
         participant: participant as WorkspaceLockParticipant
       };
     }
@@ -377,25 +384,39 @@ async function readWorkspaceLockEntry(file: string) {
   }
 
   return {
-    active: Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS
+    active: heartbeatIsFresh
   };
 }
 
-function startCompatibilityHeartbeat(entryPath: string) {
+export function startCompatibilityHeartbeat(
+  entryPath: string,
+  interval = WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS
+) {
   let stopped = false;
-  const heartbeat = setInterval(() => {
-    const now = new Date();
-    void fs.promises.utimes(entryPath, now, now).catch((error: NodeJS.ErrnoException) => {
-      if (!stopped && error.code !== "ENOENT") {
-        core.warning(`Could not refresh Prisma workspace lock at ${entryPath}: ${error.message}`);
-      }
-    });
-  }, WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS);
+  const heartbeat = new Worker(
+    `
+      const fs = require("node:fs");
+      const { workerData } = require("node:worker_threads");
+      setInterval(() => {
+        const now = new Date();
+        fs.utimes(workerData.entryPath, now, now, () => {});
+      }, workerData.interval);
+    `,
+    {
+      eval: true,
+      workerData: { entryPath, interval }
+    }
+  );
+  heartbeat.on("error", (error) => {
+    if (!stopped) {
+      core.warning(`Prisma workspace lock heartbeat failed at ${entryPath}: ${error.message}`);
+    }
+  });
   heartbeat.unref();
 
   return () => {
     stopped = true;
-    clearInterval(heartbeat);
+    void heartbeat.terminate();
   };
 }
 

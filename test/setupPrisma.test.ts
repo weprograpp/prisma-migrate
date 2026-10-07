@@ -10,6 +10,7 @@ import {
   parseRuntimeDependencies,
   processIdentityOwnsLock,
   resolveVersion,
+  startCompatibilityHeartbeat,
   type PrismaRuntime
 } from "../src/setupPrisma";
 
@@ -40,16 +41,38 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
 });
 
 test("processIdentityOwnsLock fails safe when identity lookup is unavailable", () => {
-  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }), true);
-  assert.equal(processIdentityOwnsLock("expected", { status: "missing" }), false);
+  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }, true), true);
+  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }, false), false);
+  assert.equal(processIdentityOwnsLock("expected", { status: "missing" }, true), false);
   assert.equal(
-    processIdentityOwnsLock("expected", { status: "found", value: "expected" }),
+    processIdentityOwnsLock("expected", { status: "found", value: "expected" }, false),
     true
   );
   assert.equal(
-    processIdentityOwnsLock("expected", { status: "found", value: "recycled" }),
+    processIdentityOwnsLock("expected", { status: "found", value: "recycled" }, true),
     false
   );
+});
+
+test("compatibility heartbeat continues while the main event loop is blocked", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-lock-heartbeat-"));
+  const entry = path.join(root, "active.ticket.json");
+  await fs.promises.writeFile(entry, "{}\n");
+  const stopHeartbeat = startCompatibilityHeartbeat(entry, 10);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const before = (await fs.promises.stat(entry)).mtimeMs;
+    const blockedUntil = Date.now() + 80;
+    while (Date.now() < blockedUntil) {
+      // Simulate synchronous work in the action process while the worker owns the heartbeat.
+    }
+    const after = (await fs.promises.stat(entry)).mtimeMs;
+    assert.ok(after > before);
+  } finally {
+    stopHeartbeat();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("materializePrismaRuntime isolates generated clients by workspace", async () => {
