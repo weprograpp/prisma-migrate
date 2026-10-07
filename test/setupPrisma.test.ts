@@ -93,3 +93,95 @@ test("materializePrismaRuntime isolates generated clients by workspace", async (
     await fs.promises.rm(root, { recursive: true, force: true });
   }
 });
+
+test("materializePrismaRuntime serializes concurrent preparation for one workspace", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-concurrent-"));
+  const runtimeDirectory = path.join(root, "runtime");
+  const workspace = path.join(root, "workspace");
+  const previousRunnerTemp = process.env.RUNNER_TEMP;
+  process.env.RUNNER_TEMP = path.join(root, "runner-temp");
+  await fs.promises.mkdir(path.join(runtimeDirectory, "node_modules"), { recursive: true });
+  await fs.promises.writeFile(path.join(runtimeDirectory, "node_modules", "runtime-marker"), "cached");
+
+  const runtime: PrismaRuntime = {
+    version: "5.22.0",
+    directory: runtimeDirectory,
+    cliEntry: path.join(runtimeDirectory, "node_modules", "prisma", "build", "index.js")
+  };
+
+  try {
+    await Promise.all([
+      materializePrismaRuntime(runtime, workspace),
+      materializePrismaRuntime(runtime, workspace)
+    ]);
+    const modules = await fs.promises.realpath(path.join(workspace, "node_modules"));
+    assert.equal(await fs.promises.readFile(path.join(modules, "runtime-marker"), "utf8"), "cached");
+  } finally {
+    if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+    else process.env.RUNNER_TEMP = previousRunnerTemp;
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("materializePrismaRuntime switches managed runtimes when configuration changes", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-switch-"));
+  const workspace = path.join(root, "workspace");
+  const previousRunnerTemp = process.env.RUNNER_TEMP;
+  process.env.RUNNER_TEMP = path.join(root, "runner-temp");
+
+  const createRuntime = async (version: string) => {
+    const directory = path.join(root, `runtime-${version}`);
+    await fs.promises.mkdir(path.join(directory, "node_modules"), { recursive: true });
+    await fs.promises.writeFile(path.join(directory, "node_modules", "runtime-marker"), version);
+    return {
+      version,
+      directory,
+      cliEntry: path.join(directory, "node_modules", "prisma", "build", "index.js")
+    } satisfies PrismaRuntime;
+  };
+
+  try {
+    const firstRuntime = await createRuntime("5.22.0");
+    const secondRuntime = await createRuntime("6.0.0");
+    await materializePrismaRuntime(firstRuntime, workspace);
+    const firstModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
+
+    await materializePrismaRuntime(secondRuntime, workspace);
+    const secondModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
+
+    assert.notEqual(firstModules, secondModules);
+    assert.equal(await fs.promises.readFile(path.join(firstModules, "runtime-marker"), "utf8"), "5.22.0");
+    assert.equal(await fs.promises.readFile(path.join(secondModules, "runtime-marker"), "utf8"), "6.0.0");
+  } finally {
+    if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+    else process.env.RUNNER_TEMP = previousRunnerTemp;
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("materializePrismaRuntime validates exact versions in existing dependencies", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-version-"));
+  const runtimeDirectory = path.join(root, "runtime");
+  const workspace = path.join(root, "workspace");
+  const zodDirectory = path.join(workspace, "node_modules", "zod");
+  await fs.promises.mkdir(path.join(runtimeDirectory, "node_modules"), { recursive: true });
+  await fs.promises.mkdir(zodDirectory, { recursive: true });
+  await fs.promises.writeFile(path.join(zodDirectory, "package.json"), '{"version":"3.25.0"}\n');
+
+  const runtime: PrismaRuntime = {
+    version: "5.22.0",
+    directory: runtimeDirectory,
+    cliEntry: path.join(runtimeDirectory, "node_modules", "prisma", "build", "index.js")
+  };
+
+  try {
+    await assert.rejects(
+      materializePrismaRuntime(runtime, workspace, { zod: "3.25.1" }),
+      /must be 3\.25\.1, but found 3\.25\.0/
+    );
+    await fs.promises.writeFile(path.join(zodDirectory, "package.json"), '{"version":"3.25.1"}\n');
+    await materializePrismaRuntime(runtime, workspace, { zod: "3.25.1" });
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});

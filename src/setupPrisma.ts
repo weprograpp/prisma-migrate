@@ -1,7 +1,7 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import semver from "semver";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
@@ -9,6 +9,9 @@ import * as path from "node:path";
 
 const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
+const WORKSPACE_RUNTIME_REVISION = "1";
+const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
+const WORKSPACE_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 
 type NpmMeta = {
   "dist-tags": Record<string, string>;
@@ -198,29 +201,190 @@ function dependencyPackagePath(nodeModules: string, packageName: string) {
   return path.join(nodeModules, ...packageName.split("/"), "package.json");
 }
 
-function getWorkspaceRuntimeRoot(
-  cwd: string,
+type WorkspaceRuntimeDescriptor = {
+  revision: string;
+  runtimeDirectory: string;
+  prismaVersion: string;
+  runtimeDependencies: RuntimeDependencies;
+};
+
+function getWorkspaceBase() {
+  const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
+  return path.join(base, "prisma-migrate-workspaces");
+}
+
+function normalizeRuntimeDependencies(runtimeDependencies: RuntimeDependencies) {
+  return Object.fromEntries(
+    Object.entries(runtimeDependencies).sort(([left], [right]) => left.localeCompare(right))
+  ) as RuntimeDependencies;
+}
+
+function getWorkspaceRuntimeDescriptor(
   runtime: PrismaRuntime,
   runtimeDependencies: RuntimeDependencies
+): WorkspaceRuntimeDescriptor {
+  return {
+    revision: WORKSPACE_RUNTIME_REVISION,
+    runtimeDirectory: path.resolve(runtime.directory),
+    prismaVersion: runtime.version,
+    runtimeDependencies: normalizeRuntimeDependencies(runtimeDependencies)
+  };
+}
+
+function getWorkspaceRuntimePaths(
+  cwd: string,
+  descriptor: WorkspaceRuntimeDescriptor
 ) {
-  const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
-  const fingerprint = createHash("sha256")
-    .update(JSON.stringify({ cwd, runtime: runtime.directory, runtimeDependencies }))
+  const projectFingerprint = createHash("sha256").update(cwd).digest("hex").slice(0, 20);
+  const runtimeFingerprint = createHash("sha256")
+    .update(JSON.stringify(descriptor))
     .digest("hex")
     .slice(0, 20);
-  return path.join(base, "prisma-migrate-workspaces", fingerprint);
+  const projectRoot = path.join(getWorkspaceBase(), projectFingerprint);
+  const runtimeRoot = path.join(projectRoot, runtimeFingerprint);
+  return {
+    projectRoot,
+    runtimeRoot,
+    nodeModules: path.join(runtimeRoot, "node_modules"),
+    manifest: path.join(runtimeRoot, WORKSPACE_RUNTIME_MANIFEST),
+    lock: path.join(projectRoot, ".materialize.lock")
+  };
+}
+
+function isPathInside(parent: string, child: string) {
+  const relative = path.relative(parent, child);
+  return (
+    relative !== "" &&
+    !relative.startsWith(`..${path.sep}`) &&
+    relative !== ".." &&
+    !path.isAbsolute(relative)
+  );
+}
+
+async function acquireWorkspaceLock(lock: string) {
+  await fs.promises.mkdir(path.dirname(lock), { recursive: true });
+  const startedAt = Date.now();
+
+  while (true) {
+    try {
+      await fs.promises.mkdir(lock);
+      return async () => fs.promises.rm(lock, { recursive: true, force: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      if (Date.now() - startedAt >= WORKSPACE_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for Prisma workspace lock at ${lock}.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 async function assertExistingDependencies(
   nodeModules: string,
   runtimeDependencies: RuntimeDependencies
 ) {
-  for (const packageName of Object.keys(runtimeDependencies)) {
-    if (!fs.existsSync(dependencyPackagePath(nodeModules, packageName))) {
+  for (const [packageName, expectedVersion] of Object.entries(runtimeDependencies)) {
+    const packagePath = dependencyPackagePath(nodeModules, packageName);
+    let installedVersion: unknown;
+    try {
+      installedVersion = JSON.parse(await fs.promises.readFile(packagePath, "utf8")).version;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       throw new Error(
-        `Existing project dependencies do not contain ${packageName}. Install it before running the action.`
+        `Existing project dependencies do not contain ${packageName}@${expectedVersion}. Install it before running the action.`
       );
     }
+    if (installedVersion !== expectedVersion) {
+      throw new Error(
+        `Existing project dependency ${packageName} must be ${expectedVersion}, but found ${String(installedVersion)}.`
+      );
+    }
+  }
+}
+
+async function isWorkspaceRuntimeReady(
+  runtimeRoot: string,
+  nodeModules: string,
+  manifest: string,
+  descriptor: WorkspaceRuntimeDescriptor
+) {
+  try {
+    if (!(await fs.promises.stat(nodeModules)).isDirectory()) return false;
+    const currentDescriptor = JSON.parse(await fs.promises.readFile(manifest, "utf8"));
+    if (JSON.stringify(currentDescriptor) !== JSON.stringify(descriptor)) return false;
+    await assertExistingDependencies(nodeModules, descriptor.runtimeDependencies);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function prepareWorkspaceRuntime(
+  runtime: PrismaRuntime,
+  descriptor: WorkspaceRuntimeDescriptor,
+  paths: ReturnType<typeof getWorkspaceRuntimePaths>
+) {
+  if (
+    await isWorkspaceRuntimeReady(
+      paths.runtimeRoot,
+      paths.nodeModules,
+      paths.manifest,
+      descriptor
+    )
+  ) {
+    return;
+  }
+
+  const stagingRoot = `${paths.runtimeRoot}.tmp-${process.pid}-${randomUUID()}`;
+  const stagingNodeModules = path.join(stagingRoot, "node_modules");
+  try {
+    await fs.promises.mkdir(stagingRoot, { recursive: true });
+    await fs.promises.cp(runtimePaths(runtime.directory).nodeModules, stagingNodeModules, {
+      recursive: true
+    });
+    await fs.promises.rm(path.join(stagingNodeModules, ".prisma"), {
+      recursive: true,
+      force: true
+    });
+    await fs.promises.writeFile(
+      path.join(stagingRoot, "package.json"),
+      `${JSON.stringify(
+        {
+          name: "prisma-migrate-workspace-runtime",
+          private: true,
+          dependencies: {
+            prisma: runtime.version,
+            "@prisma/client": runtime.version,
+            tsx: TSX_VERSION,
+            ...descriptor.runtimeDependencies
+          }
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    if (Object.keys(descriptor.runtimeDependencies).length > 0) {
+      core.info(
+        `Installing ${Object.keys(descriptor.runtimeDependencies).length} additional runtime dependencies...`
+      );
+      await exec.exec(
+        "npm",
+        ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock", "--prefer-offline"],
+        { cwd: stagingRoot }
+      );
+      await assertExistingDependencies(stagingNodeModules, descriptor.runtimeDependencies);
+    }
+
+    await fs.promises.writeFile(
+      path.join(stagingRoot, WORKSPACE_RUNTIME_MANIFEST),
+      `${JSON.stringify(descriptor)}\n`
+    );
+    await fs.promises.rm(paths.runtimeRoot, { recursive: true, force: true });
+    await fs.promises.rename(stagingRoot, paths.runtimeRoot);
+  } finally {
+    await fs.promises.rm(stagingRoot, { recursive: true, force: true });
   }
 }
 
@@ -231,69 +395,53 @@ export async function materializePrismaRuntime(
 ) {
   const cwd = path.resolve(workingDirectory);
   const target = path.join(cwd, "node_modules");
-  const source = runtimePaths(runtime.directory).nodeModules;
-  const workspaceRuntimeRoot = getWorkspaceRuntimeRoot(cwd, runtime, runtimeDependencies);
-  const workspaceNodeModules = path.join(workspaceRuntimeRoot, "node_modules");
-  const current = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    throw error;
-  });
+  const descriptor = getWorkspaceRuntimeDescriptor(runtime, runtimeDependencies);
+  const paths = getWorkspaceRuntimePaths(cwd, descriptor);
+  const releaseLock = await acquireWorkspaceLock(paths.lock);
 
-  if (current) {
-    if (current.isSymbolicLink()) {
-      const resolvedTarget = await fs.promises.realpath(target);
-      const resolvedWorkspace = await fs.promises.realpath(workspaceNodeModules).catch(() => "");
-      if (resolvedTarget !== resolvedWorkspace) {
+  try {
+    await fs.promises.mkdir(cwd, { recursive: true });
+    const current = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+
+    if (current && !current.isSymbolicLink()) {
+      await assertExistingDependencies(target, descriptor.runtimeDependencies);
+      core.info(`Using existing project dependencies at ${target}.`);
+      return;
+    }
+
+    if (current?.isSymbolicLink()) {
+      const linkedPath = path.resolve(path.dirname(target), await fs.promises.readlink(target));
+      if (!isPathInside(getWorkspaceBase(), linkedPath)) {
         throw new Error(`Refusing to replace existing node_modules symlink at ${target}.`);
       }
-    } else {
-      await assertExistingDependencies(target, runtimeDependencies);
-      core.info(`Using existing project dependencies at ${target}.`);
+      if (
+        linkedPath === paths.nodeModules &&
+        (await isWorkspaceRuntimeReady(
+          paths.runtimeRoot,
+          paths.nodeModules,
+          paths.manifest,
+          descriptor
+        ))
+      ) {
+        core.info(`Using materialized Prisma runtime at ${target}.`);
+        return;
+      }
+      await fs.promises.unlink(target);
     }
-    return;
-  }
 
-  await fs.promises.mkdir(cwd, { recursive: true });
-  await fs.promises.rm(workspaceRuntimeRoot, { recursive: true, force: true });
-  await fs.promises.mkdir(workspaceRuntimeRoot, { recursive: true });
-  await fs.promises.cp(source, workspaceNodeModules, { recursive: true });
-  await fs.promises.rm(path.join(workspaceNodeModules, ".prisma"), {
-    recursive: true,
-    force: true
-  });
-  await fs.promises.writeFile(
-    path.join(workspaceRuntimeRoot, "package.json"),
-    `${JSON.stringify(
-      {
-        name: "prisma-migrate-workspace-runtime",
-        private: true,
-        dependencies: {
-          prisma: runtime.version,
-          "@prisma/client": runtime.version,
-          tsx: TSX_VERSION,
-          ...runtimeDependencies
-        }
-      },
-      null,
-      2
-    )}\n`
-  );
-
-  if (Object.keys(runtimeDependencies).length > 0) {
-    core.info(`Installing ${Object.keys(runtimeDependencies).length} additional runtime dependencies...`);
-    await exec.exec(
-      "npm",
-      ["install", "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock", "--prefer-offline"],
-      { cwd: workspaceRuntimeRoot }
+    await prepareWorkspaceRuntime(runtime, descriptor, paths);
+    await fs.promises.symlink(
+      paths.nodeModules,
+      target,
+      process.platform === "win32" ? "junction" : "dir"
     );
+    core.info(`Materialized isolated Prisma runtime into ${target}.`);
+  } finally {
+    await releaseLock();
   }
-
-  await fs.promises.symlink(
-    workspaceNodeModules,
-    target,
-    process.platform === "win32" ? "junction" : "dir"
-  );
-  core.info(`Materialized isolated Prisma runtime into ${target}.`);
 }
 
 export async function ensurePrismaCli(versionInput: string) {
