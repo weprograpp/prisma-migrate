@@ -229,12 +229,17 @@ export function getWorkspaceExecutionScope(
     .slice(0, 20);
 }
 
-function getWorkspaceBase() {
+function getWorkspaceStorageRoot() {
   const base = process.env.RUNNER_TEMP?.trim() || os.tmpdir();
+  return path.join(base, "prisma-migrate-workspaces");
+}
+
+function getWorkspaceBase() {
+  const storageRoot = getWorkspaceStorageRoot();
   const executionScope = getWorkspaceExecutionScope();
   return executionScope
-    ? path.join(base, "prisma-migrate-workspaces", executionScope)
-    : path.join(base, "prisma-migrate-workspaces");
+    ? path.join(storageRoot, executionScope)
+    : storageRoot;
 }
 
 function normalizeRuntimeDependencies(runtimeDependencies: RuntimeDependencies) {
@@ -709,7 +714,7 @@ export async function materializePrismaRuntime(
 
     if (current?.isSymbolicLink()) {
       const linkedPath = path.resolve(path.dirname(target), await fs.promises.readlink(target));
-      if (!isPathInside(getWorkspaceBase(), linkedPath)) {
+      if (!isPathInside(getWorkspaceStorageRoot(), linkedPath)) {
         throw new Error(`Refusing to replace existing node_modules symlink at ${target}.`);
       }
       if (

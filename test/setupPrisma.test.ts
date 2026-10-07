@@ -253,11 +253,17 @@ test("materializePrismaRuntime holds the workspace lease until the caller releas
   }
 });
 
-test("materializePrismaRuntime switches managed runtimes when configuration changes", async () => {
+test("materializePrismaRuntime switches managed runtimes across GitHub executions", async () => {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-switch-"));
   const workspace = path.join(root, "workspace");
   const previousRunnerTemp = process.env.RUNNER_TEMP;
+  const previousRunId = process.env.GITHUB_RUN_ID;
+  const previousRunAttempt = process.env.GITHUB_RUN_ATTEMPT;
+  const previousJob = process.env.GITHUB_JOB;
   process.env.RUNNER_TEMP = path.join(root, "runner-temp");
+  process.env.GITHUB_RUN_ID = "100";
+  process.env.GITHUB_RUN_ATTEMPT = "1";
+  process.env.GITHUB_JOB = "runtime-switch";
 
   const createRuntime = async (version: string) => {
     const directory = path.join(root, `runtime-${version}`);
@@ -277,6 +283,7 @@ test("materializePrismaRuntime switches managed runtimes when configuration chan
     const firstModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
     await releaseFirst();
 
+    process.env.GITHUB_RUN_ID = "101";
     const releaseSecond = await materializePrismaRuntime(secondRuntime, workspace);
     const secondModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
 
@@ -287,6 +294,12 @@ test("materializePrismaRuntime switches managed runtimes when configuration chan
   } finally {
     if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
     else process.env.RUNNER_TEMP = previousRunnerTemp;
+    if (previousRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = previousRunId;
+    if (previousRunAttempt === undefined) delete process.env.GITHUB_RUN_ATTEMPT;
+    else process.env.GITHUB_RUN_ATTEMPT = previousRunAttempt;
+    if (previousJob === undefined) delete process.env.GITHUB_JOB;
+    else process.env.GITHUB_JOB = previousJob;
     await fs.promises.rm(root, { recursive: true, force: true });
   }
 });
