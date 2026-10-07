@@ -11,7 +11,8 @@ const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
-const WORKSPACE_LOCK_OWNER_GRACE_MS = 30 * 1000;
+const WORKSPACE_LOCK_STALE_MS = 60 * 1000;
+const WORKSPACE_LOCK_HEARTBEAT_MS = 10 * 1000;
 const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
 const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
 
@@ -289,6 +290,10 @@ async function writeWorkspaceLockEntry(file: string, participant: WorkspaceLockP
 }
 
 async function readWorkspaceLockEntry(file: string) {
+  const entryStat = await fs.promises.stat(file).catch(() => undefined);
+  if (!entryStat) return { active: false, missing: true };
+  const heartbeatIsFresh = Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_STALE_MS;
+
   try {
     const participant = JSON.parse(
       await fs.promises.readFile(file, "utf8")
@@ -299,7 +304,7 @@ async function readWorkspaceLockEntry(file: string) {
       typeof participant.token === "string"
     ) {
       return {
-        active: isProcessAlive(participant.pid),
+        active: heartbeatIsFresh && isProcessAlive(participant.pid),
         participant: participant as WorkspaceLockParticipant
       };
     }
@@ -307,10 +312,24 @@ async function readWorkspaceLockEntry(file: string) {
     // A participant can disappear while its owner releases the lock.
   }
 
-  const entryStat = await fs.promises.stat(file).catch(() => undefined);
-  if (!entryStat) return { active: false, missing: true };
-  return {
-    active: Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS
+  return { active: heartbeatIsFresh };
+}
+
+function startWorkspaceLockHeartbeat(ticketPath: string) {
+  let stopped = false;
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    void fs.promises.utimes(ticketPath, now, now).catch((error: NodeJS.ErrnoException) => {
+      if (!stopped && error.code !== "ENOENT") {
+        core.warning(`Could not refresh Prisma workspace lock at ${ticketPath}: ${error.message}`);
+      }
+    });
+  }, WORKSPACE_LOCK_HEARTBEAT_MS);
+  heartbeat.unref();
+
+  return () => {
+    stopped = true;
+    clearInterval(heartbeat);
   };
 }
 
@@ -344,6 +363,7 @@ export async function acquireWorkspaceLock(lock: string) {
   const choosingPath = path.join(lock, `${token}${WORKSPACE_LOCK_CHOOSING_SUFFIX}`);
   const ticketPath = path.join(lock, `${token}${WORKSPACE_LOCK_TICKET_SUFFIX}`);
   await writeWorkspaceLockEntry(choosingPath, participant);
+  let stopHeartbeat: (() => void) | undefined = startWorkspaceLockHeartbeat(choosingPath);
 
   try {
     let existingTickets: Awaited<ReturnType<typeof listWorkspaceLockParticipants>>;
@@ -365,7 +385,9 @@ export async function acquireWorkspaceLock(lock: string) {
         )
       ) + 1;
     await writeWorkspaceLockEntry(ticketPath, participant);
+    stopHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
+    stopHeartbeat = startWorkspaceLockHeartbeat(ticketPath);
 
     while (true) {
       const choosing = await listWorkspaceLockParticipants(
@@ -390,13 +412,17 @@ export async function acquireWorkspaceLock(lock: string) {
           throw new Error(`Prisma workspace lock ticket disappeared at ${ticketPath}.`);
         }
         if (orderedTickets[0]?.token === token) {
-          return async () => fs.promises.rm(ticketPath, { force: true });
+          return async () => {
+            stopHeartbeat?.();
+            await fs.promises.rm(ticketPath, { force: true });
+          };
         }
       }
 
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   } catch (error) {
+    stopHeartbeat?.();
     await fs.promises.rm(choosingPath, { force: true });
     await fs.promises.rm(ticketPath, { force: true });
     throw error;

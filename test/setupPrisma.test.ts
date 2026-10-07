@@ -199,7 +199,7 @@ test("materializePrismaRuntime validates exact versions in existing dependencies
   }
 });
 
-test("acquireWorkspaceLock safely serializes contenders after an abandoned lock", async () => {
+test("acquireWorkspaceLock safely serializes contenders after abandoned entries", async () => {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-stale-lock-"));
   const lock = path.join(root, "workspace.lock");
   await fs.promises.mkdir(lock, { recursive: true });
@@ -210,8 +210,15 @@ test("acquireWorkspaceLock safely serializes contenders after an abandoned lock"
   });
   const abandonedChoosing = path.join(lock, "abandoned.choosing.json");
   const abandonedTicket = path.join(lock, "abandoned.ticket.json");
+  const recycledPidTicket = path.join(lock, "recycled-pid.ticket.json");
   await fs.promises.writeFile(abandonedChoosing, `${abandoned}\n`);
   await fs.promises.writeFile(abandonedTicket, `${abandoned}\n`);
+  await fs.promises.writeFile(
+    recycledPidTicket,
+    `${JSON.stringify({ pid: process.pid, token: "recycled-pid", number: 1 })}\n`
+  );
+  const staleTime = new Date(Date.now() - 2 * 60_000);
+  await fs.promises.utimes(recycledPidTicket, staleTime, staleTime);
 
   try {
     let acquiredCount = 0;
@@ -229,6 +236,7 @@ test("acquireWorkspaceLock safely serializes contenders after an abandoned lock"
     assert.equal(fs.existsSync(lock), true);
     assert.equal(fs.existsSync(abandonedChoosing), false);
     assert.equal(fs.existsSync(abandonedTicket), false);
+    assert.equal(fs.existsSync(recycledPidTicket), false);
 
     await winner.release();
     const follower = await (winner.name === "first" ? secondAcquisition : firstAcquisition);
