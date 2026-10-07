@@ -199,22 +199,42 @@ test("materializePrismaRuntime validates exact versions in existing dependencies
   }
 });
 
-test("acquireWorkspaceLock recovers a lock owned by a terminated process", async () => {
+test("acquireWorkspaceLock safely serializes contenders after an abandoned lock", async () => {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-stale-lock-"));
   const lock = path.join(root, "workspace.lock");
   await fs.promises.mkdir(lock, { recursive: true });
-  await fs.promises.writeFile(
-    path.join(lock, "owner.json"),
-    `${JSON.stringify({ pid: 99_999_999, token: "abandoned", acquiredAt: Date.now() })}\n`
-  );
+  const abandoned = JSON.stringify({
+    pid: 99_999_999,
+    token: "abandoned",
+    number: 1
+  });
+  const abandonedChoosing = path.join(lock, "abandoned.choosing.json");
+  const abandonedTicket = path.join(lock, "abandoned.ticket.json");
+  await fs.promises.writeFile(abandonedChoosing, `${abandoned}\n`);
+  await fs.promises.writeFile(abandonedTicket, `${abandoned}\n`);
 
   try {
-    const release = await acquireWorkspaceLock(lock);
-    const owner = JSON.parse(await fs.promises.readFile(path.join(lock, "owner.json"), "utf8"));
-    assert.equal(owner.pid, process.pid);
-    assert.notEqual(owner.token, "abandoned");
-    await release();
-    assert.equal(fs.existsSync(lock), false);
+    let acquiredCount = 0;
+    const firstAcquisition = acquireWorkspaceLock(lock).then((release) => {
+      acquiredCount += 1;
+      return { name: "first", release };
+    });
+    const secondAcquisition = acquireWorkspaceLock(lock).then((release) => {
+      acquiredCount += 1;
+      return { name: "second", release };
+    });
+    const winner = await Promise.race([firstAcquisition, secondAcquisition]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(acquiredCount, 1);
+    assert.equal(fs.existsSync(lock), true);
+    assert.equal(fs.existsSync(abandonedChoosing), false);
+    assert.equal(fs.existsSync(abandonedTicket), false);
+
+    await winner.release();
+    const follower = await (winner.name === "first" ? secondAcquisition : firstAcquisition);
+    assert.equal(acquiredCount, 2);
+    await follower.release();
+    assert.deepEqual(await fs.promises.readdir(lock), []);
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }

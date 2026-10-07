@@ -11,9 +11,9 @@ const RUNTIME_REVISION = "3";
 const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
-const WORKSPACE_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 const WORKSPACE_LOCK_OWNER_GRACE_MS = 30 * 1000;
-const WORKSPACE_LOCK_OWNER = "owner.json";
+const WORKSPACE_LOCK_CHOOSING_SUFFIX = ".choosing.json";
+const WORKSPACE_LOCK_TICKET_SUFFIX = ".ticket.json";
 
 type NpmMeta = {
   "dist-tags": Record<string, string>;
@@ -263,10 +263,10 @@ function isPathInside(parent: string, child: string) {
   );
 }
 
-type WorkspaceLockOwner = {
+type WorkspaceLockParticipant = {
   pid: number;
   token: string;
-  acquiredAt: number;
+  number?: number;
 };
 
 function isProcessAlive(pid: number) {
@@ -278,74 +278,128 @@ function isProcessAlive(pid: number) {
   }
 }
 
-async function recoverAbandonedWorkspaceLock(lock: string) {
-  let abandoned = false;
+async function writeWorkspaceLockEntry(file: string, participant: WorkspaceLockParticipant) {
+  const staging = `${file}.${randomUUID()}.tmp`;
   try {
-    const owner = JSON.parse(
-      await fs.promises.readFile(path.join(lock, WORKSPACE_LOCK_OWNER), "utf8")
-    ) as Partial<WorkspaceLockOwner>;
-    abandoned =
-      typeof owner.pid === "number" && owner.pid > 0 ? !isProcessAlive(owner.pid) : false;
+    await fs.promises.writeFile(staging, `${JSON.stringify(participant)}\n`, { flag: "wx" });
+    await fs.promises.rename(staging, file);
+  } finally {
+    await fs.promises.rm(staging, { force: true });
+  }
+}
+
+async function readWorkspaceLockEntry(file: string) {
+  try {
+    const participant = JSON.parse(
+      await fs.promises.readFile(file, "utf8")
+    ) as Partial<WorkspaceLockParticipant>;
+    if (
+      typeof participant.pid === "number" &&
+      participant.pid > 0 &&
+      typeof participant.token === "string"
+    ) {
+      return {
+        active: isProcessAlive(participant.pid),
+        participant: participant as WorkspaceLockParticipant
+      };
+    }
   } catch {
-    const lockStat = await fs.promises.stat(lock).catch(() => undefined);
-    abandoned = Boolean(
-      lockStat && Date.now() - lockStat.mtimeMs >= WORKSPACE_LOCK_OWNER_GRACE_MS
-    );
+    // A participant can disappear while its owner releases the lock.
   }
 
-  if (!abandoned) return false;
+  const entryStat = await fs.promises.stat(file).catch(() => undefined);
+  if (!entryStat) return { active: false, missing: true };
+  return {
+    active: Date.now() - entryStat.mtimeMs < WORKSPACE_LOCK_OWNER_GRACE_MS
+  };
+}
 
-  const abandonedPath = `${lock}.abandoned-${randomUUID()}`;
-  try {
-    await fs.promises.rename(lock, abandonedPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
+async function listWorkspaceLockParticipants(lock: string, suffix: string) {
+  const names = (await fs.promises.readdir(lock)).filter((name) => name.endsWith(suffix));
+  const participants: WorkspaceLockParticipant[] = [];
+  let hasUnknownActiveEntry = false;
+
+  for (const name of names) {
+    const file = path.join(lock, name);
+    const state = await readWorkspaceLockEntry(file);
+    if (!state.active) {
+      await fs.promises.rm(file, { force: true });
+      if (!state.missing) core.warning(`Recovered abandoned Prisma workspace lock entry at ${file}.`);
+    } else if (state.participant) {
+      participants.push(state.participant);
+    } else {
+      hasUnknownActiveEntry = true;
+    }
   }
-  await fs.promises.rm(abandonedPath, { recursive: true, force: true });
-  core.warning(`Recovered abandoned Prisma workspace lock at ${lock}.`);
-  return true;
+
+  return { participants, hasUnknownActiveEntry };
 }
 
 export async function acquireWorkspaceLock(lock: string) {
-  await fs.promises.mkdir(path.dirname(lock), { recursive: true });
-  const startedAt = Date.now();
-  const owner: WorkspaceLockOwner = {
-    pid: process.pid,
-    token: randomUUID(),
-    acquiredAt: Date.now()
-  };
+  // Lamport's bakery algorithm keeps every contender in a unique file. That makes
+  // abandoned-entry cleanup safe because a recovered path is never reused by a new owner.
+  await fs.promises.mkdir(lock, { recursive: true });
+  const token = randomUUID();
+  const participant: WorkspaceLockParticipant = { pid: process.pid, token };
+  const choosingPath = path.join(lock, `${token}${WORKSPACE_LOCK_CHOOSING_SUFFIX}`);
+  const ticketPath = path.join(lock, `${token}${WORKSPACE_LOCK_TICKET_SUFFIX}`);
+  await writeWorkspaceLockEntry(choosingPath, participant);
 
-  while (true) {
-    try {
-      await fs.promises.mkdir(lock);
-      try {
-        await fs.promises.writeFile(
-          path.join(lock, WORKSPACE_LOCK_OWNER),
-          `${JSON.stringify(owner)}\n`
+  try {
+    let existingTickets: Awaited<ReturnType<typeof listWorkspaceLockParticipants>>;
+    do {
+      existingTickets = await listWorkspaceLockParticipants(
+        lock,
+        WORKSPACE_LOCK_TICKET_SUFFIX
+      );
+      if (existingTickets.hasUnknownActiveEntry) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } while (existingTickets.hasUnknownActiveEntry);
+
+    participant.number =
+      Math.max(
+        0,
+        ...existingTickets.participants.map((entry) =>
+          Number.isSafeInteger(entry.number) ? entry.number! : 0
+        )
+      ) + 1;
+    await writeWorkspaceLockEntry(ticketPath, participant);
+    await fs.promises.rm(choosingPath, { force: true });
+
+    while (true) {
+      const choosing = await listWorkspaceLockParticipants(
+        lock,
+        WORKSPACE_LOCK_CHOOSING_SUFFIX
+      );
+      const tickets = await listWorkspaceLockParticipants(lock, WORKSPACE_LOCK_TICKET_SUFFIX);
+      const invalidTicket = tickets.participants.some(
+        (entry) => !Number.isSafeInteger(entry.number)
+      );
+
+      if (
+        choosing.participants.length === 0 &&
+        !choosing.hasUnknownActiveEntry &&
+        !tickets.hasUnknownActiveEntry &&
+        !invalidTicket
+      ) {
+        const orderedTickets = tickets.participants.sort(
+          (left, right) => left.number! - right.number! || left.token.localeCompare(right.token)
         );
-      } catch (error) {
-        await fs.promises.rm(lock, { recursive: true, force: true });
-        throw error;
-      }
-      return async () => {
-        const currentOwner = await fs.promises
-          .readFile(path.join(lock, WORKSPACE_LOCK_OWNER), "utf8")
-          .then((value) => JSON.parse(value) as Partial<WorkspaceLockOwner>)
-          .catch(() => undefined);
-        if (currentOwner?.token === owner.token) {
-          await fs.promises.rm(lock, { recursive: true, force: true });
+        if (!orderedTickets.some((entry) => entry.token === token)) {
+          throw new Error(`Prisma workspace lock ticket disappeared at ${ticketPath}.`);
         }
-      };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
-      if (await recoverAbandonedWorkspaceLock(lock)) continue;
-      if (Date.now() - startedAt >= WORKSPACE_LOCK_TIMEOUT_MS) {
-        throw new Error(`Timed out waiting for Prisma workspace lock at ${lock}.`);
+        if (orderedTickets[0]?.token === token) {
+          return async () => fs.promises.rm(ticketPath, { force: true });
+        }
       }
+
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+  } catch (error) {
+    await fs.promises.rm(choosingPath, { force: true });
+    await fs.promises.rm(ticketPath, { force: true });
+    throw error;
   }
 }
 
