@@ -280,15 +280,18 @@ export type ProcessIdentityResult =
   | { status: "missing" }
   | { status: "unknown" };
 
-export function processIdentityOwnsLock(
+export type WorkspaceLockOwnership = "active" | "abandoned" | "uncertain";
+
+export function classifyWorkspaceLockOwnership(
   expectedIdentity: string,
   currentIdentity: ProcessIdentityResult,
   heartbeatIsFresh: boolean
-) {
-  return (
-    (currentIdentity.status === "unknown" && heartbeatIsFresh) ||
-    (currentIdentity.status === "found" && currentIdentity.value === expectedIdentity)
-  );
+): WorkspaceLockOwnership {
+  if (currentIdentity.status === "found") {
+    return currentIdentity.value === expectedIdentity ? "active" : "abandoned";
+  }
+  if (currentIdentity.status === "missing") return "abandoned";
+  return heartbeatIsFresh ? "active" : "uncertain";
 }
 
 function getMissingProcessResult(pid: number): ProcessIdentityResult {
@@ -370,12 +373,14 @@ async function readWorkspaceLockEntry(file: string) {
       typeof participant.processIdentity === "string"
     ) {
       const currentIdentity = await getProcessIdentity(participant.pid);
+      const ownership = classifyWorkspaceLockOwnership(
+        participant.processIdentity,
+        currentIdentity,
+        heartbeatIsFresh
+      );
       return {
-        active: processIdentityOwnsLock(
-          participant.processIdentity,
-          currentIdentity,
-          heartbeatIsFresh
-        ),
+        active: ownership === "active",
+        uncertain: ownership === "uncertain",
         participant: participant as WorkspaceLockParticipant
       };
     }
@@ -392,8 +397,7 @@ export function startCompatibilityHeartbeat(
   entryPath: string,
   interval = WORKSPACE_LOCK_COMPAT_HEARTBEAT_MS,
   onCompromised: (error: Error) => void = (error) => {
-    core.setFailed(error.message);
-    process.exit(1);
+    core.warning(error.message);
   }
 ) {
   let stopped = false;
@@ -451,7 +455,11 @@ async function listWorkspaceLockParticipants(lock: string, suffix: string) {
   for (const name of names) {
     const file = path.join(lock, name);
     const state = await readWorkspaceLockEntry(file);
-    if (!state.active) {
+    if (state.uncertain) {
+      throw new Error(
+        `Cannot safely verify Prisma workspace lock ownership at ${file}; refusing to remove it.`
+      );
+    } else if (!state.active) {
       await fs.promises.rm(file, { force: true });
       if (!state.missing) core.warning(`Recovered abandoned Prisma workspace lock entry at ${file}.`);
     } else if (state.participant) {

@@ -5,10 +5,10 @@ import * as path from "node:path";
 import test from "node:test";
 import {
   acquireWorkspaceLock,
+  classifyWorkspaceLockOwnership,
   loadPrismaRuntime,
   materializePrismaRuntime,
   parseRuntimeDependencies,
-  processIdentityOwnsLock,
   resolveVersion,
   startCompatibilityHeartbeat,
   type PrismaRuntime
@@ -40,17 +40,34 @@ test("parseRuntimeDependencies requires exact versions and protects managed pack
   assert.throws(() => parseRuntimeDependencies('{"prisma":"5.22.0"}'), /managed/);
 });
 
-test("processIdentityOwnsLock fails safe when identity lookup is unavailable", () => {
-  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }, true), true);
-  assert.equal(processIdentityOwnsLock("expected", { status: "unknown" }, false), false);
-  assert.equal(processIdentityOwnsLock("expected", { status: "missing" }, true), false);
+test("classifyWorkspaceLockOwnership fails safe when identity lookup is unavailable", () => {
   assert.equal(
-    processIdentityOwnsLock("expected", { status: "found", value: "expected" }, false),
-    true
+    classifyWorkspaceLockOwnership("expected", { status: "unknown" }, true),
+    "active"
   );
   assert.equal(
-    processIdentityOwnsLock("expected", { status: "found", value: "recycled" }, true),
-    false
+    classifyWorkspaceLockOwnership("expected", { status: "unknown" }, false),
+    "uncertain"
+  );
+  assert.equal(
+    classifyWorkspaceLockOwnership("expected", { status: "missing" }, true),
+    "abandoned"
+  );
+  assert.equal(
+    classifyWorkspaceLockOwnership(
+      "expected",
+      { status: "found", value: "expected" },
+      false
+    ),
+    "active"
+  );
+  assert.equal(
+    classifyWorkspaceLockOwnership(
+      "expected",
+      { status: "found", value: "recycled" },
+      true
+    ),
+    "abandoned"
   );
 });
 
