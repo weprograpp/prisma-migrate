@@ -108,6 +108,7 @@ async function runPrismaCommand(options: {
 }
 
 async function run() {
+  let releaseWorkspace: (() => Promise<void>) | undefined;
   try {
     const mode = (getInput("mode") || "execute") as Mode;
     const prismaVersion = getInput("prisma-version") || "5.22.0";
@@ -133,7 +134,7 @@ async function run() {
     const runtime = runtimeDirectory
       ? await loadPrismaRuntime(runtimeDirectory)
       : await ensurePrismaRuntime(prismaVersion);
-    await materializePrismaRuntime(runtime, cwd, runtimeDependencies);
+    releaseWorkspace = await materializePrismaRuntime(runtime, cwd, runtimeDependencies);
     core.setOutput("runtime-directory", runtime.directory);
     core.setOutput("setup-ms", Date.now() - setupStarted);
 
@@ -222,6 +223,14 @@ async function run() {
     if (anyFail) core.setFailed("One or more Prisma operations failed. See logs above.");
   } catch (err: any) {
     core.setFailed(err?.message ?? String(err));
+  } finally {
+    if (releaseWorkspace) {
+      try {
+        await releaseWorkspace();
+      } catch (err: any) {
+        core.setFailed(`Could not release Prisma workspace lock: ${err?.message ?? String(err)}`);
+      }
+    }
   }
 }
 

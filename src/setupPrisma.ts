@@ -12,6 +12,8 @@ const TSX_VERSION = "4.19.1";
 const WORKSPACE_RUNTIME_REVISION = "1";
 const WORKSPACE_RUNTIME_MANIFEST = ".prisma-migrate-workspace-runtime.json";
 const WORKSPACE_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
+const WORKSPACE_LOCK_OWNER_GRACE_MS = 30 * 1000;
+const WORKSPACE_LOCK_OWNER = "owner.json";
 
 type NpmMeta = {
   "dist-tags": Record<string, string>;
@@ -261,17 +263,84 @@ function isPathInside(parent: string, child: string) {
   );
 }
 
-async function acquireWorkspaceLock(lock: string) {
+type WorkspaceLockOwner = {
+  pid: number;
+  token: string;
+  acquiredAt: number;
+};
+
+function isProcessAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function recoverAbandonedWorkspaceLock(lock: string) {
+  let abandoned = false;
+  try {
+    const owner = JSON.parse(
+      await fs.promises.readFile(path.join(lock, WORKSPACE_LOCK_OWNER), "utf8")
+    ) as Partial<WorkspaceLockOwner>;
+    abandoned =
+      typeof owner.pid === "number" && owner.pid > 0 ? !isProcessAlive(owner.pid) : false;
+  } catch {
+    const lockStat = await fs.promises.stat(lock).catch(() => undefined);
+    abandoned = Boolean(
+      lockStat && Date.now() - lockStat.mtimeMs >= WORKSPACE_LOCK_OWNER_GRACE_MS
+    );
+  }
+
+  if (!abandoned) return false;
+
+  const abandonedPath = `${lock}.abandoned-${randomUUID()}`;
+  try {
+    await fs.promises.rename(lock, abandonedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+  await fs.promises.rm(abandonedPath, { recursive: true, force: true });
+  core.warning(`Recovered abandoned Prisma workspace lock at ${lock}.`);
+  return true;
+}
+
+export async function acquireWorkspaceLock(lock: string) {
   await fs.promises.mkdir(path.dirname(lock), { recursive: true });
   const startedAt = Date.now();
+  const owner: WorkspaceLockOwner = {
+    pid: process.pid,
+    token: randomUUID(),
+    acquiredAt: Date.now()
+  };
 
   while (true) {
     try {
       await fs.promises.mkdir(lock);
-      return async () => fs.promises.rm(lock, { recursive: true, force: true });
+      try {
+        await fs.promises.writeFile(
+          path.join(lock, WORKSPACE_LOCK_OWNER),
+          `${JSON.stringify(owner)}\n`
+        );
+      } catch (error) {
+        await fs.promises.rm(lock, { recursive: true, force: true });
+        throw error;
+      }
+      return async () => {
+        const currentOwner = await fs.promises
+          .readFile(path.join(lock, WORKSPACE_LOCK_OWNER), "utf8")
+          .then((value) => JSON.parse(value) as Partial<WorkspaceLockOwner>)
+          .catch(() => undefined);
+        if (currentOwner?.token === owner.token) {
+          await fs.promises.rm(lock, { recursive: true, force: true });
+        }
+      };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
+      if (await recoverAbandonedWorkspaceLock(lock)) continue;
       if (Date.now() - startedAt >= WORKSPACE_LOCK_TIMEOUT_MS) {
         throw new Error(`Timed out waiting for Prisma workspace lock at ${lock}.`);
       }
@@ -409,7 +478,7 @@ export async function materializePrismaRuntime(
     if (current && !current.isSymbolicLink()) {
       await assertExistingDependencies(target, descriptor.runtimeDependencies);
       core.info(`Using existing project dependencies at ${target}.`);
-      return;
+      return releaseLock;
     }
 
     if (current?.isSymbolicLink()) {
@@ -427,7 +496,7 @@ export async function materializePrismaRuntime(
         ))
       ) {
         core.info(`Using materialized Prisma runtime at ${target}.`);
-        return;
+        return releaseLock;
       }
       await fs.promises.unlink(target);
     }
@@ -439,8 +508,10 @@ export async function materializePrismaRuntime(
       process.platform === "win32" ? "junction" : "dir"
     );
     core.info(`Materialized isolated Prisma runtime into ${target}.`);
-  } finally {
+    return releaseLock;
+  } catch (error) {
     await releaseLock();
+    throw error;
   }
 }
 

@@ -102,8 +102,9 @@ If your schema uses `env("DATABASE_URL")`, pass a database URL even for `generat
 - If multiple database URLs are provided, `generate` uses the first one to satisfy schemas that rely on `DATABASE_URL`.
 - The composite wrapper restores `~/.cache/prisma-migrate` with `actions/cache`; the cache key is scoped by OS, architecture, runtime revision, and Prisma version.
 - Each dependency-free project gets an isolated copy of the prepared runtime, so generated Prisma clients never write into the shared cache or another workspace.
+- Action invocations for the same project are serialized through setup, generate, migrate, and seed; locks left by terminated processes are recovered automatically.
 - `runtime-dependencies` accepts package names mapped to exact semantic versions. Pass the same value to `prepare` and `execute` so those packages can be installed during the parallel preparation phase.
-- Existing project dependencies are never replaced. When `node_modules` already exists, every declared runtime dependency must already be installed there.
+- Existing project dependencies are never replaced. When `node_modules` already exists, every declared runtime dependency must already be installed there at the exact requested version.
 - Node.js 20 is configured for both `prepare` and `execute` invocations.
 - Set `PRISMA_MIGRATE_CACHE_DIR` if you want to store the downloaded Prisma versions in a custom cache location.
 

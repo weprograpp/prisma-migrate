@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import {
+  acquireWorkspaceLock,
   loadPrismaRuntime,
   materializePrismaRuntime,
   parseRuntimeDependencies,
@@ -63,8 +64,8 @@ test("materializePrismaRuntime isolates generated clients by workspace", async (
   };
 
   try {
-    await materializePrismaRuntime(runtime, workspaceOne);
-    await materializePrismaRuntime(runtime, workspaceTwo);
+    const releaseWorkspaceOne = await materializePrismaRuntime(runtime, workspaceOne);
+    const releaseWorkspaceTwo = await materializePrismaRuntime(runtime, workspaceTwo);
 
     const modulesOne = await fs.promises.realpath(path.join(workspaceOne, "node_modules"));
     const modulesTwo = await fs.promises.realpath(path.join(workspaceTwo, "node_modules"));
@@ -87,6 +88,8 @@ test("materializePrismaRuntime isolates generated clients by workspace", async (
       ),
       "must-not-copy"
     );
+    await releaseWorkspaceOne();
+    await releaseWorkspaceTwo();
   } finally {
     if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
     else process.env.RUNNER_TEMP = previousRunnerTemp;
@@ -94,7 +97,7 @@ test("materializePrismaRuntime isolates generated clients by workspace", async (
   }
 });
 
-test("materializePrismaRuntime serializes concurrent preparation for one workspace", async () => {
+test("materializePrismaRuntime holds the workspace lease until the caller releases it", async () => {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-concurrent-"));
   const runtimeDirectory = path.join(root, "runtime");
   const workspace = path.join(root, "workspace");
@@ -110,12 +113,19 @@ test("materializePrismaRuntime serializes concurrent preparation for one workspa
   };
 
   try {
-    await Promise.all([
-      materializePrismaRuntime(runtime, workspace),
-      materializePrismaRuntime(runtime, workspace)
-    ]);
+    const releaseFirst = await materializePrismaRuntime(runtime, workspace);
+    let secondAcquired = false;
+    const secondMaterialization = materializePrismaRuntime(runtime, workspace).then((release) => {
+      secondAcquired = true;
+      return release;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(secondAcquired, false);
+    await releaseFirst();
+    const releaseSecond = await secondMaterialization;
     const modules = await fs.promises.realpath(path.join(workspace, "node_modules"));
     assert.equal(await fs.promises.readFile(path.join(modules, "runtime-marker"), "utf8"), "cached");
+    await releaseSecond();
   } finally {
     if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
     else process.env.RUNNER_TEMP = previousRunnerTemp;
@@ -143,15 +153,17 @@ test("materializePrismaRuntime switches managed runtimes when configuration chan
   try {
     const firstRuntime = await createRuntime("5.22.0");
     const secondRuntime = await createRuntime("6.0.0");
-    await materializePrismaRuntime(firstRuntime, workspace);
+    const releaseFirst = await materializePrismaRuntime(firstRuntime, workspace);
     const firstModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
+    await releaseFirst();
 
-    await materializePrismaRuntime(secondRuntime, workspace);
+    const releaseSecond = await materializePrismaRuntime(secondRuntime, workspace);
     const secondModules = await fs.promises.realpath(path.join(workspace, "node_modules"));
 
     assert.notEqual(firstModules, secondModules);
     assert.equal(await fs.promises.readFile(path.join(firstModules, "runtime-marker"), "utf8"), "5.22.0");
     assert.equal(await fs.promises.readFile(path.join(secondModules, "runtime-marker"), "utf8"), "6.0.0");
+    await releaseSecond();
   } finally {
     if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
     else process.env.RUNNER_TEMP = previousRunnerTemp;
@@ -180,7 +192,29 @@ test("materializePrismaRuntime validates exact versions in existing dependencies
       /must be 3\.25\.1, but found 3\.25\.0/
     );
     await fs.promises.writeFile(path.join(zodDirectory, "package.json"), '{"version":"3.25.1"}\n');
-    await materializePrismaRuntime(runtime, workspace, { zod: "3.25.1" });
+    const release = await materializePrismaRuntime(runtime, workspace, { zod: "3.25.1" });
+    await release();
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("acquireWorkspaceLock recovers a lock owned by a terminated process", async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "prisma-runtime-stale-lock-"));
+  const lock = path.join(root, "workspace.lock");
+  await fs.promises.mkdir(lock, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(lock, "owner.json"),
+    `${JSON.stringify({ pid: 99_999_999, token: "abandoned", acquiredAt: Date.now() })}\n`
+  );
+
+  try {
+    const release = await acquireWorkspaceLock(lock);
+    const owner = JSON.parse(await fs.promises.readFile(path.join(lock, "owner.json"), "utf8"));
+    assert.equal(owner.pid, process.pid);
+    assert.notEqual(owner.token, "abandoned");
+    await release();
+    assert.equal(fs.existsSync(lock), false);
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }
