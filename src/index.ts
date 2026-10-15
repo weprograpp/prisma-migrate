@@ -1,9 +1,15 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as path from "node:path";
-import { ensurePrismaCli } from "./setupPrisma";
+import {
+  ensurePrismaRuntime,
+  loadPrismaRuntime,
+  materializePrismaRuntime,
+  parseRuntimeDependencies
+} from "./setupPrisma";
 
 type PrismaOperation = "generate" | "migrate" | "seed";
+type Mode = "prepare" | "execute";
 
 type Result = {
   operation: PrismaOperation;
@@ -77,19 +83,11 @@ async function runPrismaCommand(options: {
   core.startGroup(`${operation[0].toUpperCase()}${operation.slice(1)}${masked ? `: ${masked}` : ""}`);
 
   try {
-    const env: Record<string, string> = {
-      PRISMA_HIDE_UPDATE_MESSAGE: "1"
-    };
-
+    const env: Record<string, string> = { PRISMA_HIDE_UPDATE_MESSAGE: "1" };
     for (const [key, value] of Object.entries(process.env)) {
-      if (typeof value === "string") {
-        env[key] = value;
-      }
+      if (typeof value === "string") env[key] = value;
     }
-
-    if (databaseUrl) {
-      env.DATABASE_URL = databaseUrl;
-    }
+    if (databaseUrl) env.DATABASE_URL = databaseUrl;
 
     const exitCode = await exec.exec("node", [cliEntry, ...args], {
       cwd,
@@ -103,7 +101,6 @@ async function runPrismaCommand(options: {
     } else {
       core.info(`${operation} completed${masked ? ` for ${masked}` : ""}.`);
     }
-
     return { operation, databaseUrlMasked: masked, ok, exitCode, ms: Date.now() - start };
   } finally {
     core.endGroup();
@@ -111,16 +108,41 @@ async function runPrismaCommand(options: {
 }
 
 async function run() {
+  let releaseWorkspace: (() => Promise<void>) | undefined;
   try {
+    const mode = (getInput("mode") || "execute") as Mode;
     const prismaVersion = getInput("prisma-version") || "5.22.0";
+    const runtimeDirectory = getInput("runtime-directory");
+    const runtimeDependencies = parseRuntimeDependencies(getInput("runtime-dependencies"));
     const schema = getInput("schema") || "prisma/schema.prisma";
-    const cwd = getInput("working-directory") || ".";
+    const cwd = path.resolve(getInput("working-directory") || ".");
     const prismaArgs = getInput("prisma-args") || "";
     const failFast = parseBooleanInput("fail-fast", true);
     const runGenerate = parseBooleanInput("generate", false);
     const runMigrate = parseBooleanInput("migrate", true);
     const runSeed = parseBooleanInput("seed", false);
     const databaseUrls = collectDatabaseUrls();
+    const setupStarted = Date.now();
+
+    if (mode !== "prepare" && mode !== "execute") {
+      core.setFailed(`Unsupported mode: ${mode}. Expected prepare or execute.`);
+      return;
+    }
+
+    for (const databaseUrl of databaseUrls) core.setSecret(databaseUrl);
+
+    const runtime = runtimeDirectory
+      ? await loadPrismaRuntime(runtimeDirectory)
+      : await ensurePrismaRuntime(prismaVersion);
+    releaseWorkspace = await materializePrismaRuntime(runtime, cwd, runtimeDependencies);
+    core.setOutput("runtime-directory", runtime.directory);
+    core.setOutput("setup-ms", Date.now() - setupStarted);
+
+    if (mode === "prepare") {
+      core.setOutput("results", "[]");
+      core.info(`Prisma runtime ${runtime.version} is ready.`);
+      return;
+    }
 
     if (!runGenerate && !runMigrate && !runSeed) {
       core.setFailed("At least one of generate, migrate, or seed must be enabled.");
@@ -132,27 +154,19 @@ async function run() {
       return;
     }
 
-    for (const databaseUrl of databaseUrls) {
-      core.setSecret(databaseUrl);
-    }
-
-    const cliEntry = await ensurePrismaCli(prismaVersion);
     const results: Result[] = [];
-
-    await exec.exec("node", [cliEntry, "--version"]);
-
+    await exec.exec("node", [runtime.cliEntry, "--version"]);
     const firstDatabaseUrl = databaseUrls[0];
 
     if (runGenerate) {
       const generateResult = await runPrismaCommand({
-        cliEntry,
+        cliEntry: runtime.cliEntry,
         cwd,
         operation: "generate",
         args: ["generate", "--schema", path.resolve(cwd, schema)],
         databaseUrl: firstDatabaseUrl
       });
       results.push(generateResult);
-
       if (!generateResult.ok) {
         core.setOutput("results", JSON.stringify(results));
         core.setFailed("Prisma generate failed. See logs above.");
@@ -171,7 +185,7 @@ async function run() {
           }
 
           const migrateResult = await runPrismaCommand({
-            cliEntry,
+            cliEntry: runtime.cliEntry,
             cwd,
             operation: "migrate",
             args: migrateArgs,
@@ -179,26 +193,22 @@ async function run() {
           });
           results.push(migrateResult);
           migrateSucceeded = migrateResult.ok;
-
-          if (!migrateResult.ok) {
-            if (failFast) {
-              core.setOutput("results", JSON.stringify(results));
-              core.setFailed("One or more Prisma migrations failed. See logs above.");
-              return;
-            }
+          if (!migrateResult.ok && failFast) {
+            core.setOutput("results", JSON.stringify(results));
+            core.setFailed("One or more Prisma migrations failed. See logs above.");
+            return;
           }
         }
 
         if (runSeed && migrateSucceeded) {
           const seedResult = await runPrismaCommand({
-            cliEntry,
+            cliEntry: runtime.cliEntry,
             cwd,
             operation: "seed",
             args: ["db", "seed"],
             databaseUrl
           });
           results.push(seedResult);
-
           if (!seedResult.ok && failFast) {
             core.setOutput("results", JSON.stringify(results));
             core.setFailed("One or more Prisma seeds failed. See logs above.");
@@ -210,12 +220,17 @@ async function run() {
 
     const anyFail = results.some((result) => !result.ok);
     core.setOutput("results", JSON.stringify(results));
-
-    if (anyFail) {
-      core.setFailed("One or more Prisma operations failed. See logs above.");
-    }
+    if (anyFail) core.setFailed("One or more Prisma operations failed. See logs above.");
   } catch (err: any) {
     core.setFailed(err?.message ?? String(err));
+  } finally {
+    if (releaseWorkspace) {
+      try {
+        await releaseWorkspace();
+      } catch (err: any) {
+        core.setFailed(`Could not release Prisma workspace lock: ${err?.message ?? String(err)}`);
+      }
+    }
   }
 }
 
